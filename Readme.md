@@ -5,9 +5,9 @@
 
 **当前版本：v1.0.0（32 位版）**
 
-- 源码：<https://gitee.com/starnight-dirt/TrpgMaps>　（镜像：<https://github.com/starnight-dirt/TrpgMaps>）
-- 下载：仓库的 **Releases** 页面
-- 作者：[starnight-dirt](https://gitee.com/starnight-dirt)
+- 源码：<https://github.com/starnight-dirt/TrpgMaps>　（镜像：<https://gitee.com/starnight-dirt/TrpgMaps>）
+- 下载：仓库的 [**Releases**](https://github.com/starnight-dirt/TrpgMaps/releases) 页面
+- 作者：[starnight-dirt](https://github.com/starnight-dirt)
 
 ---
 
