@@ -1,0 +1,27 @@
+# ---- 构建中间产物与输出 ----
+# 三个工程各有一套 bin/obj：主程序、installer、updater。这里的模式能一起匹配到。
+obj/
+bin/
+build_logs/
+
+# 安装程序的内嵌负载：由 scripts/make_release.ps1 从 bin\Release 现打（约 34 MB），
+# 属于可再生成的产物，不进版本库。
+installer/payload.zip
+
+# ---- 运行期状态 ----
+# 这些是程序/测试跑起来之后才产生的，不是源码：
+app.log
+drawing.json
+TrpgMapsUpdater.log
+
+# ---- 编辑器 / 工具 ----
+.vs/
+*.user
+*.suo
+
+# ---- 用户上传的底图 ----
+# maps\ 里保留仓库自带的示例底图；如果你把上传内容也当数据管理，放开下一行
+# maps/*
+
+# 注意：version.json **要**提交。程序靠它判断仓库里有没有新版本
+# （见 Core\UpdateCheck.cs），它是发布清单而不是构建产物。

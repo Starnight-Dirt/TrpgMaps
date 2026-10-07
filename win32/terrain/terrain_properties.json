@@ -1,0 +1,156 @@
+[
+	{
+		"name": "树",
+		"file": "树.png",
+		"disadvantageous": false,
+		"cover": true,
+		"obstacle": true,
+		"climb": true,
+		"damage": "",
+		"opacity": 1.0,
+		"note": "树干占格、树冠提供遮蔽；可攀爬（运动检定），也可作为半身掩护"
+	},
+	{
+		"name": "冰面",
+		"file": "冰面.png",
+		"disadvantageous": true,
+		"cover": false,
+		"obstacle": false,
+		"climb": false,
+		"damage": "",
+		"opacity": 1.0,
+		"note": "困难地形；每回合开始敏捷豁免 DC10，失败则倒地"
+	},
+	{
+		"name": "墙",
+		"file": "墙.png",
+		"disadvantageous": false,
+		"cover": true,
+		"obstacle": true,
+		"climb": true,
+		"damage": "",
+		"opacity": 1.0,
+		"note": "全遮蔽、不可穿越；可攀爬（运动检定）"
+	},
+	{
+		"name": "岩浆",
+		"file": "岩浆.png",
+		"disadvantageous": false,
+		"cover": false,
+		"obstacle": true,
+		"climb": false,
+		"damage": "2d6 火焰",
+		"opacity": 1.0,
+		"note": "进入或被推入的瞬间受伤，回合结束仍在其中再受一次；不可站立"
+	},
+	{
+		"name": "建筑外墙",
+		"file": "建筑外墙.png",
+		"disadvantageous": false,
+		"cover": true,
+		"obstacle": true,
+		"climb": false,
+		"damage": "",
+		"opacity": 1.0,
+		"note": "全遮蔽、不可穿越；墙面平整不可攀爬"
+	},
+	{
+		"name": "木桥",
+		"file": "木桥.png",
+		"disadvantageous": false,
+		"cover": false,
+		"obstacle": false,
+		"climb": false,
+		"damage": "",
+		"opacity": 1.0,
+		"note": "正常通行"
+	},
+	{
+		"name": "毒雾",
+		"file": "毒雾.png",
+		"disadvantageous": true,
+		"cover": false,
+		"obstacle": false,
+		"climb": false,
+		"damage": "1d4 毒素",
+		"opacity": 0.75,
+		"note": "重度遮蔽 + 困难地形；每回合开始体质豁免，失败则中毒"
+	},
+	{
+		"name": "水",
+		"file": "水.png",
+		"disadvantageous": true,
+		"cover": false,
+		"obstacle": false,
+		"climb": false,
+		"damage": "",
+		"opacity": 1.0,
+		"note": "困难地形；游泳需要运动检定（无游泳速度时）"
+	},
+	{
+		"name": "油脂",
+		"file": "油脂.png",
+		"disadvantageous": true,
+		"cover": false,
+		"obstacle": false,
+		"climb": false,
+		"damage": "",
+		"opacity": 1.0,
+		"note": "困难地形；进入或回合开始敏捷豁免 DC10，失败则倒地"
+	},
+	{
+		"name": "火焰",
+		"file": "火焰.png",
+		"disadvantageous": false,
+		"cover": false,
+		"obstacle": false,
+		"climb": false,
+		"damage": "1d6 火焰",
+		"opacity": 0.85,
+		"note": "进入或回合开始受伤；火焰还提供轻度遮蔽"
+	},
+	{
+		"name": "石桥",
+		"file": "石桥.png",
+		"disadvantageous": false,
+		"cover": false,
+		"obstacle": false,
+		"climb": false,
+		"damage": "",
+		"opacity": 1.0,
+		"note": "正常通行"
+	},
+	{
+		"name": "迷雾",
+		"file": "迷雾.png",
+		"disadvantageous": false,
+		"cover": false,
+		"obstacle": false,
+		"climb": false,
+		"damage": "",
+		"opacity": 0.70,
+		"note": "重度遮蔽：看不清内部，内部的生物也看不清外面"
+	},
+	{
+		"name": "高草丛",
+		"file": "高草丛.png",
+		"disadvantageous": true,
+		"cover": true,
+		"obstacle": false,
+		"climb": false,
+		"damage": "",
+		"opacity": 1.0,
+		"note": "困难地形；对 30 尺外的观察者提供轻度遮蔽（半身掩护）"
+	},
+	{
+		"name": "云雾",
+		"file": "云雾.png",
+		"disadvantageous": false,
+		"cover": false,
+		"obstacle": false,
+		"climb": false,
+		"damage": "",
+		"opacity": 0.75,
+		"note": "轻度遮蔽；高空云雾，可视作飞行单位的遮挡物"
+	}
+]

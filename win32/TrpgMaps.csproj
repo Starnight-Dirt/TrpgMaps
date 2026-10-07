@@ -1,0 +1,187 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  TrpgMaps —— Win7 / 32 位兼容版（经典 .NET Framework 工程）
+
+  技术选型说明：
+  * **目标框架固定为 v3.5**（唯一的发布目标，见下）。
+  * x86：32 位版本的 exe 在 32 位与 64 位 Windows 上都能运行。
+  * WinForms + GDI+：不依赖任何第三方库，Win7 自带。
+  * 内置 Web 服务器用 TcpListener 手写极简 HTTP/1.1：
+    不用 HttpListener 是因为它在 Windows 上绑定非 localhost 前缀需要管理员权限或
+    netsh urlacl 预留，而 TcpListener 普通用户即可监听端口。
+  * 不使用 async/await、System.Text.Json、Tuple、HashSet 等 .NET 4.0+ 才有的能力。
+
+  为什么只留 v3.5 这一个目标（结论，别再改回去）：
+    * v3.5 编出来的 exe 从 **Win7 SP1 一直到 Win11** 都能跑，而且**一台机器都不用装东西**：
+      Win7 用它自带、默认启用的 .NET 3.5.1；Win8/10/11 的 3.5 功能默认是关的，
+      于是按 <exe>.config 里的顺序落到系统自带的 CLR 4.x 上跑同一份 IL。
+    * v4.0 目标反而更窄：Win7 出厂没有 .NET 4.x，必须先下载安装（约 48MB + 重启）。
+      v4.0 能跑的机器 v3.5 全都能跑，反之不然 —— 所以 v3.5 **严格占优**，
+      留着 v4.0 只会多一个"该发哪一版"的选择困难。
+    * 代价只是不能用 .NET 4.0 之后的 API，而本工程本来就没用。
+-->
+<Project ToolsVersion="4.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <Configuration Condition=" '$(Configuration)' == '' ">Release</Configuration>
+    <Platform Condition=" '$(Platform)' == '' ">x86</Platform>
+    <ProductVersion>8.0.30703</ProductVersion>
+    <SchemaVersion>2.0</SchemaVersion>
+    <ProjectGuid>{8E2B7C41-5A3D-4E6F-9B12-7C4D0A5E1F88}</ProjectGuid>
+    <OutputType>WinExe</OutputType>
+    <AppDesignerFolder>Properties</AppDesignerFolder>
+    <RootNamespace>TrpgMaps</RootNamespace>
+    <AssemblyName>TrpgMaps</AssemblyName>
+    <TargetFrameworkVersion>v3.5</TargetFrameworkVersion>
+    <TargetFrameworkProfile />
+    <FileAlignment>512</FileAlignment>
+    <LangVersion>7.3</LangVersion>
+    <!-- 使用 PackageReference 还原方式（本工程唯一的包见下方 ItemGroup 注释） -->
+    <RestoreProjectStyle>PackageReference</RestoreProjectStyle>
+    <!--
+      图标 / 版本信息。
+      ApplicationIcon 会把 .ico 直接编译进 PE 的资源段，因此：
+        * 资源管理器 / 任务栏 / 快捷方式看到的都是这个图标；
+        * 运行期还可以用 Icon.ExtractAssociatedIcon(exe) 取回来当窗口图标，
+          不需要额外随 exe 复制一份 .ico 文件（见 MainForm 的 ApplyAppIcon）。
+      路径相对本 .csproj（即 win7版本\），不要写成 ..\Resources\。
+    -->
+    <ApplicationIcon>Resources\appicon.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|x86' ">
+    <DebugSymbols>true</DebugSymbols>
+    <DebugType>full</DebugType>
+    <Optimize>false</Optimize>
+    <OutputPath>bin\Debug\</OutputPath>
+    <DefineConstants>DEBUG;TRACE</DefineConstants>
+    <ErrorReport>prompt</ErrorReport>
+    <WarningLevel>4</WarningLevel>
+    <PlatformTarget>x86</PlatformTarget>
+  </PropertyGroup>
+
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|x86' ">
+    <DebugType>pdbonly</DebugType>
+    <Optimize>true</Optimize>
+    <OutputPath>bin\Release\</OutputPath>
+    <DefineConstants>TRACE</DefineConstants>
+    <ErrorReport>prompt</ErrorReport>
+    <WarningLevel>4</WarningLevel>
+    <PlatformTarget>x86</PlatformTarget>
+
+
+  </PropertyGroup>
+
+  <!-- 只用 .NET Framework 自带的程序集，不引入任何运行期第三方库 -->
+  <ItemGroup>
+    <Reference Include="System" />
+    <Reference Include="System.Core" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="System.Windows.Forms" />
+  </ItemGroup>
+
+  <!--
+    编译期参考程序集（关键，务必保留）。
+    * PrivateAssets=All  —— 不流向下游，也不会被打包。
+    * ExcludeAssets=runtime —— 明确声明它不参与运行期，输出目录不会有任何多余文件。
+    它只做一件事：让 MSBuild 找到 v3.5 的参考程序集，从而无需在本机安装
+    .NET Framework 3.5 开发人员工具包（Targeting Pack）即可编译。
+  -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="Theme.cs" />
+    <Compile Include="Widgets.cs" />
+    <Compile Include="MainForm.cs" />
+    <Compile Include="MapCanvas.cs" />
+    <Compile Include="DrawPanel.cs" />
+    <Compile Include="DrawOverlay.cs" />
+    <Compile Include="SidebarPanel.cs" />
+    <Compile Include="UpdateDialog.cs" />
+    <Compile Include="SelfCheck.cs" />
+    <Compile Include="Core\AppInfo.cs" />
+    <Compile Include="Core\AppEnv.cs" />
+    <Compile Include="Core\AppRegistry.cs" />
+    <Compile Include="Core\MiniZip.cs" />
+    <Compile Include="Core\UpdateCheck.cs" />
+    <Compile Include="Core\GridAnchor.cs" />
+    <Compile Include="Core\FirewallCheck.cs" />
+    <Compile Include="Core\Models.cs" />
+    <Compile Include="Core\ImageLoader.cs" />
+    <Compile Include="Core\Vp8Tables.cs" />
+    <Compile Include="Core\Vp8Decoder.cs" />
+    <Compile Include="Core\MapStore.cs" />
+    <Compile Include="Core\MapTone.cs" />
+    <Compile Include="Core\TerrainCatalog.cs" />
+    <Compile Include="Core\TerrainImageCache.cs" />
+    <Compile Include="Core\DrawingStore.cs" />
+    <Compile Include="Core\GameState.cs" />
+    <Compile Include="Core\RealtimeHub.cs" />
+    <Compile Include="Core\MiniJson.cs" />
+    <Compile Include="Core\HttpServer.cs" />
+    <Compile Include="Core\Routes.cs" />
+    <Compile Include="Core\PngWriter.cs" />
+    <Compile Include="Core\QrCodeGenerator.cs" />
+    <Compile Include="Properties\AssemblyInfo.cs" />
+  </ItemGroup>
+
+  <!-- 玩家端网页与底图：构建时复制到输出目录，运行时直接读取 -->
+  <ItemGroup>
+    <Content Include="wwwroot\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="maps\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <!-- 绘图素材：terrain\entity\item 三个目录，整体拷到 exe 同级 -->
+    <Content Include="terrain\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="entity\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="item\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <!--
+      窗口图标源文件。exe 的资源段里已经有图标（ApplicationIcon），
+      但 .NET 的 Icon.ExtractAssociatedIcon 只拿得到 32x32 那一张；
+      把 .ico 也拷一份到 exe 同级，运行期就能 new Icon(path, 256, 256) 取大图，
+      Alt+Tab / 高 DPI 缩放下不糊。取不到时自动回退到 exe 里那张（见 ApplyAppIcon）。
+    -->
+    <Content Include="Resources\appicon.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <!--
+      作者头像（"关于"面板用）。放在 Resources 而不是 wwwroot：
+      wwwroot 是**会被内置 Web 服务器当静态文件发出去的**，
+      头像跟玩家端网页没有任何关系，没必要暴露在局域网上。
+    -->
+    <Content Include="Resources\avatar.png">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="App.net35.config" />
+  </ItemGroup>
+
+  <!--
+    给 exe 附一个 <exe>.config。
+    same IL, two runtimes：先找 Win7 自带的 CLR 2.0，找不到就退回新系统自带的
+    CLR 4.x —— 这样同一个 exe 从 Win7 到 Win11 都能跑，一次安装都不用做。
+    文件名刻意不叫 App.config，免得被 MSBuild 的默认约定再贴一遍造成重复。
+  -->
+  <Target Name="AttachRuntimeFallbackConfig" AfterTargets="Build"
+          Condition=" Exists('App.net35.config') ">
+    <Copy SourceFiles="App.net35.config" DestinationFiles="$(TargetPath).config" />
+    <Message Importance="high" Text="[net35] runtime fallback config -> $(TargetPath).config" />
+  </Target>
+
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+</Project>

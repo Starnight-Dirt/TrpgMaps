@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>TrpgMaps 玩家视图</title>
+    <link rel="stylesheet" href="/css/player.css">
+</head>
+<body>
+    <!-- 登录遮罩 -->
+    <div id="login-overlay">
+        <div id="login-box">
+            <h2>🎲 加入游戏</h2>
+            <div id="room-lock-notice">🔒 房间已锁定</div>
+            <input type="text" id="player-name-input" placeholder="输入你的玩家名称" maxlength="20">
+            <button id="login-btn">进入</button>
+            <div id="login-error" class="error"></div>
+            <div id="login-info" class="info"></div>
+        </div>
+    </div>
+
+    <!-- 顶部工具栏 -->
+    <div id="player-toolbar">
+        <span>👤 <span id="display-player-name" class="player-name">未知</span></span>
+        <span class="status" id="connection-status">● 在线</span>
+    </div>
+
+    <!-- 地图容器 -->
+    <div id="player-map-container">
+        <div id="player-map-wrapper">
+            <img id="player-map-image" src="" alt="地图">
+            <!-- 绘图层（地形 / 实体 / 物品）：夹在底图和网格之间 -->
+            <canvas id="player-draw-canvas"></canvas>
+            <canvas id="player-grid-canvas"></canvas>
+        </div>
+    </div>
+
+    <script src="/js/realtime.js"></script>
+    <script src="/js/player.js"></script>
+</body>
+</html>

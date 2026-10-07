@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  TrpgMapsSetup —— 安装 / 卸载程序。
+
+  * 目标框架同样是 **v3.5**：这样在一台从没装过任何 .NET 的裸 Win7 SP1 上，
+    双击安装包就能直接起来（这也是主程序的技术约束，见 TrpgMaps.csproj 的注释）。
+  * **单文件**：程序本体（exe、底图、素材、玩家页）全部作为嵌入资源打进去，
+    所以发布时只需要给用户一个 exe，不用附带 payload 目录。
+  * app.manifest 里声明了 requireAdministrator —— 装到 Program Files、
+    写 HKLM 的卸载项都必须提权。
+
+  嵌入资源 TrpgMaps.payload.zip 由 tools\make_release.ps1 在编译前生成。
+-->
+<Project ToolsVersion="4.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <Configuration Condition=" '$(Configuration)' == '' ">Release</Configuration>
+    <Platform Condition=" '$(Platform)' == '' ">x86</Platform>
+    <ProjectGuid>{D71F3C86-9E24-4B7A-B5D3-08C6F1E24A9B}</ProjectGuid>
+    <OutputType>WinExe</OutputType>
+    <RootNamespace>TrpgMaps</RootNamespace>
+    <AssemblyName>TrpgMapsSetup</AssemblyName>
+    <TargetFrameworkVersion>v3.5</TargetFrameworkVersion>
+    <TargetFrameworkProfile />
+    <FileAlignment>512</FileAlignment>
+    <LangVersion>7.3</LangVersion>
+    <RestoreProjectStyle>PackageReference</RestoreProjectStyle>
+    <ApplicationIcon>..\Resources\appicon.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|x86' ">
+    <DebugType>none</DebugType>
+    <Optimize>true</Optimize>
+    <OutputPath>bin\Release\</OutputPath>
+    <DefineConstants>TRACE</DefineConstants>
+    <ErrorReport>prompt</ErrorReport>
+    <WarningLevel>4</WarningLevel>
+    <PlatformTarget>x86</PlatformTarget>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="System" />
+    <Reference Include="System.Core" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="System.Windows.Forms" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="SetupForm.cs" />
+    <Compile Include="..\Theme.cs">
+      <Link>Theme.cs</Link>
+    </Compile>
+    <Compile Include="..\Core\AppInfo.cs">
+      <Link>Core\AppInfo.cs</Link>
+    </Compile>
+    <Compile Include="..\Core\AppRegistry.cs">
+      <Link>Core\AppRegistry.cs</Link>
+    </Compile>
+    <Compile Include="..\Core\AppEnv.cs">
+      <Link>Core\AppEnv.cs</Link>
+    </Compile>
+    <Compile Include="..\Core\MiniZip.cs">
+      <Link>Core\MiniZip.cs</Link>
+    </Compile>
+    <Compile Include="Properties\AssemblyInfo.cs" />
+  </ItemGroup>
+
+  <!--
+    程序负载。逻辑名固定成 TrpgMaps.payload.zip，SetupForm 按这个名字取。
+    Condition 是为了让"还没生成负载"时也能编译出一个空壳（方便先跑通界面）。
+  -->
+  <ItemGroup>
+    <EmbeddedResource Include="payload.zip" Condition=" Exists('payload.zip') ">
+      <LogicalName>TrpgMaps.payload.zip</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\App.net35.config" />
+  </ItemGroup>
+
+  <Target Name="AttachRuntimeFallbackConfig" AfterTargets="Build"
+          Condition=" Exists('..\App.net35.config') ">
+    <Copy SourceFiles="..\App.net35.config" DestinationFiles="$(TargetPath).config" />
+  </Target>
+
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+</Project>

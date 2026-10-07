@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  TrpgMapsUpdater —— 升级包里的那个小升级器。
+
+  和主程序同一套技术约束：.NET Framework **v3.5** / x86 / 零第三方运行期 DLL，
+  这样它在任何能跑主程序的机器上都能跑（包括裸 Win7 SP1）。
+
+  它故意不引 `Widgets.cs` / `MainForm.cs` 那些界面代码，只链四个 Core 文件：
+    * AppInfo.cs     版本号与仓库地址（版本号的唯一出处）
+    * AppRegistry.cs 注册表与快捷方式
+    * AppEnv.cs      路径与日志
+    * MiniJson.cs    解析包里的 update.json
+    * MiniZip.cs     只在 `test-zip` 自检模式里用到（验证我们自己的包能解开）
+  这样编出来只有几十 KB —— 升级包要能秒下，不能塞一个几 MB 的 exe 进去。
+-->
+<Project ToolsVersion="4.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <Configuration Condition=" '$(Configuration)' == '' ">Release</Configuration>
+    <Platform Condition=" '$(Platform)' == '' ">x86</Platform>
+    <ProjectGuid>{C4E9A7D2-1B63-4F58-8A21-6D3E9B0C7F41}</ProjectGuid>
+    <OutputType>WinExe</OutputType>
+    <RootNamespace>TrpgMaps</RootNamespace>
+    <AssemblyName>TrpgMapsUpdater</AssemblyName>
+    <TargetFrameworkVersion>v3.5</TargetFrameworkVersion>
+    <TargetFrameworkProfile />
+    <FileAlignment>512</FileAlignment>
+    <LangVersion>7.3</LangVersion>
+    <RestoreProjectStyle>PackageReference</RestoreProjectStyle>
+    <ApplicationIcon>..\Resources\appicon.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|x86' ">
+    <DebugType>none</DebugType>
+    <Optimize>true</Optimize>
+    <OutputPath>bin\Release\</OutputPath>
+    <DefineConstants>TRACE</DefineConstants>
+    <ErrorReport>prompt</ErrorReport>
+    <WarningLevel>4</WarningLevel>
+    <PlatformTarget>x86</PlatformTarget>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="System" />
+    <Reference Include="System.Core" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="System.Windows.Forms" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="..\Core\AppInfo.cs">
+      <Link>Core\AppInfo.cs</Link>
+    </Compile>
+    <Compile Include="..\Core\AppRegistry.cs">
+      <Link>Core\AppRegistry.cs</Link>
+    </Compile>
+    <Compile Include="..\Core\AppEnv.cs">
+      <Link>Core\AppEnv.cs</Link>
+    </Compile>
+    <Compile Include="..\Core\MiniJson.cs">
+      <Link>Core\MiniJson.cs</Link>
+    </Compile>
+    <Compile Include="..\Core\MiniZip.cs">
+      <Link>Core\MiniZip.cs</Link>
+    </Compile>
+    <Compile Include="Properties\AssemblyInfo.cs" />
+  </ItemGroup>
+
+  <!-- 和主程序一样：给 exe 贴一个运行时回退 config，Win7 到 Win11 通吃 -->
+  <ItemGroup>
+    <None Include="..\App.net35.config" />
+  </ItemGroup>
+
+  <Target Name="AttachRuntimeFallbackConfig" AfterTargets="Build"
+          Condition=" Exists('..\App.net35.config') ">
+    <Copy SourceFiles="..\App.net35.config" DestinationFiles="$(TargetPath).config" />
+  </Target>
+
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+</Project>
