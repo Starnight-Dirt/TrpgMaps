@@ -1,7 +1,7 @@
 [
 	{
 		"name": "树",
-		"file": "树.png",
+		"file": "树.webp",
 		"disadvantageous": false,
 		"cover": true,
 		"obstacle": true,
@@ -12,7 +12,7 @@
 	},
 	{
 		"name": "冰面",
-		"file": "冰面.png",
+		"file": "冰面.webp",
 		"disadvantageous": true,
 		"cover": false,
 		"obstacle": false,
@@ -23,7 +23,7 @@
 	},
 	{
 		"name": "墙",
-		"file": "墙.png",
+		"file": "墙.webp",
 		"disadvantageous": false,
 		"cover": true,
 		"obstacle": true,
@@ -34,7 +34,7 @@
 	},
 	{
 		"name": "岩浆",
-		"file": "岩浆.png",
+		"file": "岩浆.webp",
 		"disadvantageous": false,
 		"cover": false,
 		"obstacle": true,
@@ -45,7 +45,7 @@
 	},
 	{
 		"name": "建筑外墙",
-		"file": "建筑外墙.png",
+		"file": "建筑外墙.webp",
 		"disadvantageous": false,
 		"cover": true,
 		"obstacle": true,
@@ -56,7 +56,7 @@
 	},
 	{
 		"name": "木桥",
-		"file": "木桥.png",
+		"file": "木桥.webp",
 		"disadvantageous": false,
 		"cover": false,
 		"obstacle": false,
@@ -67,7 +67,7 @@
 	},
 	{
 		"name": "毒雾",
-		"file": "毒雾.png",
+		"file": "毒雾.webp",
 		"disadvantageous": true,
 		"cover": false,
 		"obstacle": false,
@@ -78,7 +78,7 @@
 	},
 	{
 		"name": "水",
-		"file": "水.png",
+		"file": "水.webp",
 		"disadvantageous": true,
 		"cover": false,
 		"obstacle": false,
@@ -89,7 +89,7 @@
 	},
 	{
 		"name": "油脂",
-		"file": "油脂.png",
+		"file": "油脂.webp",
 		"disadvantageous": true,
 		"cover": false,
 		"obstacle": false,
@@ -100,7 +100,7 @@
 	},
 	{
 		"name": "火焰",
-		"file": "火焰.png",
+		"file": "火焰.webp",
 		"disadvantageous": false,
 		"cover": false,
 		"obstacle": false,
@@ -111,7 +111,7 @@
 	},
 	{
 		"name": "石桥",
-		"file": "石桥.png",
+		"file": "石桥.webp",
 		"disadvantageous": false,
 		"cover": false,
 		"obstacle": false,
@@ -122,7 +122,7 @@
 	},
 	{
 		"name": "迷雾",
-		"file": "迷雾.png",
+		"file": "迷雾.webp",
 		"disadvantageous": false,
 		"cover": false,
 		"obstacle": false,
@@ -133,7 +133,7 @@
 	},
 	{
 		"name": "高草丛",
-		"file": "高草丛.png",
+		"file": "高草丛.webp",
 		"disadvantageous": true,
 		"cover": true,
 		"obstacle": false,
@@ -144,7 +144,7 @@
 	},
 	{
 		"name": "云雾",
-		"file": "云雾.png",
+		"file": "云雾.webp",
 		"disadvantageous": false,
 		"cover": false,
 		"obstacle": false,

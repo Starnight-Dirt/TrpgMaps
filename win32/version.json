@@ -1,9 +1,9 @@
 {
-    "version":  "1.0.0",
-    "notes":  "TrpgMaps 1.0.0 - win32 build",
-    "update":  "TrpgMaps_v1.0.0_win32_update.zip",
-    "portable":  "TrpgMaps_v1.0.0_win32_portable.zip",
-    "installer":  "TrpgMaps_v1.0.0_win32_installer.exe",
+    "version":  "1.0.1",
+    "notes":  "TrpgMaps 1.0.1 - win32 build",
+    "update":  "TrpgMaps_v1.0.1_win32_update.zip",
+    "portable":  "TrpgMaps_v1.0.1_win32_portable.zip",
+    "installer":  "TrpgMaps_v1.0.1_win32_installer.exe",
     "mandatory":  false,
     "releaseNotes":  "https://gitee.com/starnight-dirt/TrpgMaps/releases"
 }

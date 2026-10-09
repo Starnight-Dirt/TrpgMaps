@@ -1,5 +1,6 @@
 using System;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -13,6 +14,11 @@ namespace TrpgMaps
     /// 从 Win7 到 Win11 都不认，`Image.FromStream` 遇到 .webp 直接抛异常。
     /// 底图一旦换成 webp，`MapCanvas` 就只画得出底色（看起来就是"全黑"），
     /// 缩略图是白底红叉，色调分析也回落到默认值。
+    ///
+    /// ⚠️ **凡是要读一张图，都必须从这里走。** 底图、底图缩略图、素材贴图、
+    /// 素材预览缩略图、色调分析全在这儿汇合。历史上就是因为有一处
+    /// （DrawPanel 的素材缩略图）自己写了 <c>Image.FromStream</c>，
+    /// 底图换了 webp 之后那一处漏改，"地图上正常、预览全黑"。
     ///
     /// 所以这里按**文件头**（不是扩展名）分派：
     ///   * 是 WebP → 交给自研的 <see cref="Vp8FrameDecoder"/>（纯托管，零第三方 DLL）；
@@ -71,6 +77,43 @@ namespace TrpgMaps
             {
                 error = ex.Message;
                 return false;
+            }
+        }
+
+        /// <summary>
+        /// 生成一张「最长边不超过 box」的等比缩略图（只缩不放），底色铺 background。
+        ///
+        /// **两个调用方（底图列表 MainForm / 素材列表 DrawPanel）必须共用这一个方法。**
+        /// 底图刚换成 webp 那会儿，底图缩略图改走了统一入口，素材缩略图却漏了 ——
+        /// DrawPanel 里还留着一份自己写的 <c>Image.FromStream</c>，GDI+ 不认 webp，
+        /// 每张都抛异常 → 缩略图变 null → 素材列表里 14 项全退化成一块深色背景。
+        /// 用户的说法很准确：「地图上画得出来，素材预览里全是黑的」。
+        /// 收敛到一处之后，"再漏改一个调用方" 这种事在结构上就不会发生了。
+        ///
+        /// 返回的位图自成一体（源图在方法内就 Dispose 掉了，不留悬空引用），
+        /// 调用方负责 Dispose。失败抛异常，由调用方决定怎么降级。
+        /// </summary>
+        public static Image LoadThumbnail(string path, int box, Color background)
+        {
+            if (box < 1) box = 1;
+
+            using (var image = Load(path))
+            {
+                var scale = Math.Min(box / (double)image.Width, box / (double)image.Height);
+                if (scale > 1d) scale = 1d;
+
+                var w = Math.Max(1, (int)Math.Round(image.Width * scale));
+                var h = Math.Max(1, (int)Math.Round(image.Height * scale));
+
+                var bmp = new Bitmap(w, h, PixelFormat.Format32bppPArgb);
+                using (var g = Graphics.FromImage(bmp))
+                {
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                    g.Clear(background);
+                    g.DrawImage(image, 0, 0, w, h);
+                }
+                return bmp;
             }
         }
 

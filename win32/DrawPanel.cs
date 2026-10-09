@@ -668,6 +668,17 @@ namespace TrpgMaps
             }
         }
 
+        /// <summary>
+        /// 素材列表里那一格小预览图（最长边 36px）。
+        ///
+        /// ⚠️ **必须走 <see cref="ImageLoader"/>。** 这里以前是自己写的一份
+        /// <c>Image.FromStream</c>，GDI+ 不认 webp —— 素材换成 webp 之后
+        /// 每张都抛异常、缩略图变 null，整个素材列表退化成一块深色背景
+        /// （"地图上画得出来，预览里全是黑的"）。底图缩略图那次改对了，这一处漏了。
+        /// 现在和 <c>MainForm.GetThumbnail</c> 共用同一个方法，不会再各漏一处。
+        ///
+        /// 失败时缓存 null，不再重试 —— 损坏的文件不该每帧都去解一遍。
+        /// </summary>
         private Image GetThumb(TerrainAsset asset)
         {
             Image cached;
@@ -676,27 +687,7 @@ namespace TrpgMaps
             Image thumb = null;
             try
             {
-                using (var fs = new FileStream(asset.Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-                {
-                    using (var image = Image.FromStream(fs))
-                    {
-                        const int box = 36;
-                        var scale = Math.Min(box / (double)image.Width, box / (double)image.Height);
-                        if (scale > 1d) scale = 1d;
-
-                        var w = Math.Max(1, (int)Math.Round(image.Width * scale));
-                        var h = Math.Max(1, (int)Math.Round(image.Height * scale));
-                        var bmp = new Bitmap(w, h, PixelFormat.Format32bppPArgb);
-                        using (var g = Graphics.FromImage(bmp))
-                        {
-                            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                            g.Clear(Theme.Background);
-                            g.DrawImage(image, 0, 0, w, h);
-                        }
-                        thumb = bmp;
-                    }
-                }
+                thumb = ImageLoader.LoadThumbnail(asset.Path, ThumbBox, Theme.Background);
             }
             catch (Exception ex)
             {
@@ -706,6 +697,9 @@ namespace TrpgMaps
             _thumbs[asset.File] = thumb;
             return thumb;
         }
+
+        /// <summary>素材缩略图的边长上限（px）。</summary>
+        private const int ThumbBox = 36;
 
         private void DisposeThumbs()
         {

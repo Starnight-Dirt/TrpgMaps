@@ -62,15 +62,9 @@ namespace TrpgMaps
                 {
                     if (System.IO.File.Exists(iconPaths[i]))
                     {
-                        // 先读进内存再构造，避免锁住文件
-                        using (var fs = new System.IO.FileStream(iconPaths[i], System.IO.FileMode.Open,
-                                   System.IO.FileAccess.Read))
-                        {
-                            using (var img = Image.FromStream(fs))
-                            {
-                                _icons[i] = new Bitmap(img);
-                            }
-                        }
+                        // 走统一入口（ImageLoader）：万一哪天侧栏图标也换成 webp，
+                        // 这里不会再单独漏一处 —— 它返回的位图自成一体、不锁文件。
+                        _icons[i] = ImageLoader.Load(iconPaths[i]);
                     }
                 }
                 catch (Exception ex)

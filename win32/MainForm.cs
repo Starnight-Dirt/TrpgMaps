@@ -1876,6 +1876,9 @@ namespace TrpgMaps
         /// 刚生成的那一瞬间还能画，等 GC 真正回收源图之后再画就会抛
         /// <c>ArgumentException: 参数无效</c>，而 WinForms 会把整个控件的绘制
         /// 换成"白底红叉"的错误图。踩过一次，别再改回去。
+        ///
+        /// 缩略图逻辑与素材列表（DrawPanel）共用 <see cref="ImageLoader.LoadThumbnail"/>，
+        /// 免得再出现"一处改了 webp、另一处忘了"。
         /// </summary>
         private Image GetThumbnail(string path)
         {
@@ -1885,25 +1888,7 @@ namespace TrpgMaps
             try
             {
                 // 统一入口：webp 走自研解码器，其它格式仍旧 GDI+
-                using (var image = ImageLoader.Load(path))
-                {
-                    const int box = 80;
-                    var scale = Math.Min(box / (double)image.Width, box / (double)image.Height);
-                    if (scale > 1d) scale = 1d;
-
-                    var w = Math.Max(1, (int)Math.Round(image.Width * scale));
-                    var h = Math.Max(1, (int)Math.Round(image.Height * scale));
-
-                    var bmp = new Bitmap(w, h);
-                    using (var g = Graphics.FromImage(bmp))
-                    {
-                        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                        g.Clear(Theme.Background);
-                        g.DrawImage(image, 0, 0, w, h);
-                    }
-                    thumb = bmp;
-                }
+                thumb = ImageLoader.LoadThumbnail(path, 80, Theme.Background);
             }
             catch (Exception ex)
             {

@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  TrpgMapsSetup - PREVIEW manifest.
+
+  Identical to app.manifest except for the execution level: asInvoker instead of
+  requireAdministrator.
+
+  Why it exists: the /uipreview screenshot mode (see Program.cs) deliberately
+  does not touch Program Files, HKLM or any shortcut, so it does not need admin
+  rights - but Windows decides whether to raise a UAC prompt by reading the
+  manifest BEFORE any of our code runs. With requireAdministrator in there, a
+  headless build/test run would stall on a prompt nobody can answer.
+
+  Only the .\build_installer.ps1 -Preview path uses this file. Everything that
+  ships (installer, uninstaller, payload) is built with app.manifest.
+-->
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+  <assemblyIdentity version="1.0.0.0" name="TrpgMaps.Setup.Preview" type="win32" />
+
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Vista / Win7 -->
+      <supportedOS Id="{e2011457-1546-43c5-a5fe-008deee3d3f0}" />
+      <!-- Win8 -->
+      <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}" />
+      <!-- Win8.1 -->
+      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}" />
+      <!-- Win10 / Win11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" />
+    </application>
+  </compatibility>
+
+  <!-- 老系统上 GDI+ 需要它才不糊 -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
+    </windowsSettings>
+  </application>
+</assembly>

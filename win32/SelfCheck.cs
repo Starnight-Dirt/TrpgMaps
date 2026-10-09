@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -164,6 +165,12 @@ namespace TrpgMaps
 
             log.Add("--- webp decoding (built-in VP8 decoder) ---");
             ok &= CheckWebpDecode(log, outDir);
+            log.Add("");
+
+            // ---------------- 素材预览缩略图 ----------------
+
+            log.Add("--- asset preview thumbnails (must not fall back to a flat fill) ---");
+            ok &= CheckAssetThumbnails(log, outDir);
             log.Add("");
 
             // ---------------- 绘图 ----------------
@@ -955,6 +962,190 @@ namespace TrpgMaps
 
             return ok;
         }
+
+        /// <summary>
+        /// 素材（绘图贴图）预览缩略图自检。
+        ///
+        /// 第十七轮踩的坑：底图换成 webp 之后，**底图缩略图改了、素材缩略图漏了**。
+        /// DrawPanel 里还留着一份自己写的 <c>Image.FromStream</c> —— GDI+ 不认 webp，
+        /// 每张都抛异常 → 缩略图变 null → 素材列表里 14 项全退化成一块深色背景。
+        /// 用户的原话很准：「地图上画得出来，素材预览里全是黑的」。
+        /// （底图那条路 MapCanvas / TerrainImageCache 走了统一入口，所以地图上是对的。）
+        ///
+        /// 这一条钉死两件事，任一塌了都说明缩略图又绕开了 <see cref="ImageLoader"/>：
+        ///   1. 三个素材目录里**每一张**都出得来缩略图（不抛异常、宽高比正确）；
+        ///   2. 缩略图**不是一块死色** —— 亮度标准差与亮度级数要够。
+        ///      纯底色正是"加载失败退化"的样子，而它**不会**抛异常，
+        ///      所以只断言"没报错"是抓不出来的，必须回读像素。
+        ///
+        /// 顺手把全部缩略图拼成一张 _asset_thumbs.png 存到自检目录，
+        /// 肉眼也能一眼确认"预览里有图"。
+        /// </summary>
+        private static bool CheckAssetThumbnails(List<string> log, string outDir)
+        {
+            TerrainCatalog catalog;
+            try
+            {
+                catalog = new TerrainCatalog();
+            }
+            catch (Exception ex)
+            {
+                AppLog.Write("扫描素材目录失败", ex);
+                return Assert(log, "素材目录扫描", false, "扫描失败：" + ex.Message);
+            }
+
+            var items = new List<TerrainAsset>();
+            foreach (var kind in DrawKind.All)
+            {
+                foreach (var asset in catalog.Of(kind)) items.Add(asset);
+            }
+
+            if (items.Count == 0)
+            {
+                log.Add("    （terrain / entity / item 三个目录里都没有素材，跳过）");
+                return true;
+            }
+
+            var ok = true;
+            var drawn = 0;
+            var flat = 0;
+
+            // 拼版图用 2 倍放大：缩略图本身只有 36px，原大小贴出来看不清
+            const int thumbBox = 36;
+            const int tile = thumbBox * 2;
+            const int caption = 15;
+            const int cols = 5;
+            const int pad = 10;
+            const int gap = 8;
+            const int titleHeight = 20;
+
+            var thumbs = new Image[items.Count];
+
+            try
+            {
+                for (var i = 0; i < items.Count; i++)
+                {
+                    var asset = items[i];
+
+                    try
+                    {
+                        thumbs[i] = ImageLoader.LoadThumbnail(asset.Path, thumbBox, Theme.Background);
+                        drawn++;
+                    }
+                    catch (Exception ex)
+                    {
+                        ok &= Assert(log, "素材缩略图 " + asset.File, false, "解码失败：" + ex.Message);
+                        continue;
+                    }
+
+                    double mean, stdDev;
+                    int levels;
+                    MeasurePixels(thumbs[i], out mean, out stdDev, out levels);
+
+                    // 门槛卡在"明显就是一块死色（= 底色）"的量级，不去苛求低对比度的素材。
+                    var pass = stdDev >= ThumbMinStdDev && levels >= ThumbMinLevels;
+                    if (!pass) flat++;
+
+                    ok &= Assert(log, "素材缩略图 " + asset.Kind + "/" + asset.File, pass,
+                        string.Format("{0}x{1} 亮度均={2:0.000} 标准差={3:0.000} 级数={4}",
+                            thumbs[i].Width, thumbs[i].Height, mean, stdDev, levels));
+                }
+
+                log.Add(string.Format("    共 {0} 张素材：出图 {1} 张，疑似死色 {2} 张",
+                    items.Count, drawn, flat));
+
+                // ---- 反证：GDI+ 直读同一个文件会怎样 ----
+                // 把"为什么必须有 ImageLoader"钉成一条可复现的结论。
+                // 刻意**不做成断言**：万一将来某个 Windows 的 GDI+ 真支持了 webp，
+                // 那也不该让自检变红 —— 只是上面对比门槛可以放松而已。
+                var naiveText = "未知";
+                try
+                {
+                    using (var fs = File.OpenRead(items[0].Path))
+                    using (var naive = Image.FromStream(fs))
+                    {
+                        naiveText = "成功（" + naive.Width + "x" + naive.Height +
+                                    "）—— 这台机器的 GDI+ 已认识 webp";
+                    }
+                }
+                catch (Exception ex)
+                {
+                    naiveText = "抛异常（" + ex.GetType().Name + "）—— 绕开 ImageLoader 的读图点都会变黑";
+                }
+                log.Add("    反证：GDI+ 的 Image.FromStream 直读 " + items[0].File + " → " + naiveText);
+
+                // ---- 拼版图（纯证据，画不出来不影响结论） ----
+                var sheetPath = Path.Combine(outDir, "_asset_thumbs.png");
+                try
+                {
+                    var rows = (items.Count + cols - 1) / cols;
+                    var width = pad * 2 + cols * tile + (cols - 1) * gap;
+                    var height = pad * 2 + titleHeight + rows * (tile + caption) + (rows - 1) * gap;
+
+                    using (var sheet = new Bitmap(width, height))
+                    {
+                        using (var g = Graphics.FromImage(sheet))
+                        {
+                            g.Clear(Theme.Background);
+                            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+
+                            using (var titleBrush = new SolidBrush(Theme.Text))
+                            {
+                                g.DrawString(
+                                    "素材预览缩略图（" + items.Count + " 张，全部经 ImageLoader.LoadThumbnail）",
+                                    Ui.Font(9f, FontStyle.Bold), titleBrush, pad, pad - 3);
+                            }
+
+                            using (var textBrush = new SolidBrush(Theme.TextDim))
+                            using (var tileBrush = new SolidBrush(Theme.Card))
+                            {
+                                for (var i = 0; i < items.Count; i++)
+                                {
+                                    var col = i % cols;
+                                    var row = i / cols;
+                                    var x = pad + col * (tile + gap);
+                                    var y = pad + titleHeight + row * (tile + caption + gap);
+
+                                    g.FillRectangle(tileBrush, x, y, tile, tile);
+                                    if (thumbs[i] != null) g.DrawImage(thumbs[i], x, y, tile, tile);
+
+                                    g.DrawString(items[i].Name, Ui.Font(7.5f), textBrush,
+                                        new RectangleF(x, y + tile + 1, tile, caption));
+                                }
+                            }
+                        }
+                        sheet.Save(sheetPath, ImageFormat.Png);
+                    }
+
+                    log.Add("    拼版图：" + Path.GetFileName(sheetPath) + "（" +
+                            items.Count + " 张缩略图，肉眼复核）");
+                }
+                catch (Exception ex)
+                {
+                    AppLog.Write("导出素材缩略图拼版失败", ex);
+                    log.Add("    （拼版图导出失败，见 app.log）");
+                }
+            }
+            finally
+            {
+                foreach (var image in thumbs)
+                {
+                    if (image != null) image.Dispose();
+                }
+            }
+
+            return ok;
+        }
+
+        /// <summary>
+        /// 素材缩略图"不是一块死色"的门槛。
+        ///
+        /// 纯 <see cref="Theme.Background"/> 底色（= 加载失败退化的样子）标准差 ≈ 0、
+        /// 亮度级数 = 1；而任何一张真实贴图缩到 36px 都远高于这两个数。
+        /// 门槛刻意留在"一眼就是死色"的量级上，不去卡正常的低对比度素材。
+        /// </summary>
+        private const double ThumbMinStdDev = 0.02;
+        private const int ThumbMinLevels = 8;
 
         /// <summary>
         /// 把对拍样本的 YUV 平面原样导出。外部解码器（libwebp / Pillow）把同一张图转成

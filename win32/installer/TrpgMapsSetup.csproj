@@ -25,7 +25,14 @@
     <LangVersion>7.3</LangVersion>
     <RestoreProjectStyle>PackageReference</RestoreProjectStyle>
     <ApplicationIcon>..\Resources\appicon.ico</ApplicationIcon>
-    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!--
+      Which manifest to embed. Overridable so that the screenshot self-check can
+      build an asInvoker copy (see app.preview.manifest and
+      scripts\build_installer.ps1 -Preview): the shipped installer must declare
+      requireAdministrator, but UAC prompts cannot be answered unattended.
+      Every normal build - including the release flow - uses app.manifest.
+    -->
+    <ApplicationManifest Condition=" '$(ApplicationManifest)' == '' ">app.manifest</ApplicationManifest>
   </PropertyGroup>
 
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|x86' ">
@@ -56,6 +63,7 @@
   <ItemGroup>
     <Compile Include="Program.cs" />
     <Compile Include="SetupForm.cs" />
+    <Compile Include="SetupUi.cs" />
     <Compile Include="..\Theme.cs">
       <Link>Theme.cs</Link>
     </Compile>
@@ -81,6 +89,20 @@
   <ItemGroup>
     <EmbeddedResource Include="payload.zip" Condition=" Exists('payload.zip') ">
       <LogicalName>TrpgMaps.payload.zip</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <!--
+    窗口 / 任务栏图标。
+    ApplicationIcon 只把图标写进 **exe 文件的 PE 资源段**（资源管理器里好看），
+    运行中的窗口用的是 Form.Icon —— 不显式赋值就是系统默认那个空白图标。
+    而安装器是**单文件**发布、卸载器还是安装器 exe 的副本（落在安装目录里，
+    旁边不一定有 Resources\），所以图标必须**编进程序集**，运行时从资源流里读，
+    不能像主程序那样去磁盘上找 Resources\appicon.ico。
+  -->
+  <ItemGroup>
+    <EmbeddedResource Include="..\Resources\appicon.ico" Condition=" Exists('..\Resources\appicon.ico') ">
+      <LogicalName>TrpgMaps.appicon.ico</LogicalName>
     </EmbeddedResource>
   </ItemGroup>
 

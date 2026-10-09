@@ -117,12 +117,17 @@ wwwroot\                    ← 玩家端网页
 | | 大小 |
 |---|---|
 | **程序本体**（exe + config + wwwroot + 图标 + 头像） | **约 0.9 MB** |
-| 自带素材数据（`maps\` ≈ 2.7 MB + `terrain\` ≈ 31 MB） | 约 34 MB |
+| 自带素材数据（`maps\` ≈ 2.6 MB + `terrain\` ≈ 1.6 MB） | 约 4.2 MB |
 
-> 那张「自带的示例底图」是 19 张 1672×941 的图（早期是 PNG、合计 50 MB；
-> 现在换成内置解码器支持的有损 WebP，只要 2.7 MB，见「底图格式」一节），
-> 地形素材 14 张 1254×1254 才是体积大头 —— 这些是**你自己的资源**，
-> 换掉/删掉目录立刻瘦下来，跟程序本身没关系。本文档里说"程序本体很小"指的都是前一行那个 0.9 MB。
+> 底图是 19 张 1672×941 的图（早期是 PNG、合计 50 MB；第十二轮换成内置解码器
+> 支持的有损 WebP，只要 2.7 MB）；地形素材是 14 张 1254×1254（早期 PNG 合计
+> 约 31 MB，**第十七轮同样换成 WebP，降到 1.6 MB** —— 安装包因此从 33 MB 缩到 5 MB）。
+> 这些是**你自己的资源**，换掉/删掉目录立刻瘦下来，跟程序本身没关系；
+> 本文档里说"程序本体很小"指的都是前一行那个 0.9 MB。
+>
+> ⚠️ 从 v1.0.0 升级上来的老安装目录里还留着这批 PNG。升级包会在
+> `deleteFiles` 里把它们删掉（`maps\*.png` 与 `terrain\*.png`）——
+> 不然素材列表会把同名的 `.png` 和 `.webp` 各列一遍。详见第 9 节的升级说明。
 
 > ⚠️ **必须**把 `TrpgMaps.exe.config` 一起拷走。
 > 少了它，exe 只认 CLR 2.0，在没有启用 .NET 3.5 的新系统上会提示"需要 .NET Framework 3.5"而打不开 ——
@@ -601,6 +606,27 @@ exe + config + wwwroot 就这些）。引 `libwebp.dll` 会把这个优点直接
    必须做 `(Y-16)·255/219`、`(U/V-128)·255/224` 之后再做 BT.601 矩阵。
    少了这一步，画面**结构完全正确**、只是**对比度只剩 86%**（发灰发白）——最不容易被发现的一类错。
 
+#### 规矩：**凡是要读一张图，都必须走 `ImageLoader`**
+
+底图、底图缩略图、素材贴图、素材**预览缩略图**、色调分析，全部汇合在
+`Core/ImageLoader.cs` 这一个入口上；缩略图再往上收一层 `ImageLoader.LoadThumbnail()`，
+底图列表和素材列表共用它。**任何一处自己写 `Image.FromStream`，就等于给 webp 留了个黑洞。**
+
+第十七轮就是这么踩的：`maps\` 换 webp 时把底图缩略图改好了，**`terrain\` 的素材缩略图漏了** ——
+`DrawPanel.GetThumb` 里还留着 `Image.FromStream`，素材一换成 webp 就每张都抛
+`ArgumentException`，缩略图变 `null`，整个素材列表退化成一块深色背景。
+用户的原话很准：**「地图上画得出来，素材预览里全是黑的」**
+（地图那条路 `MapCanvas` / `TerrainImageCache` 走的是统一入口，所以是对的）。
+
+排查这类问题不要靠猜：`--selfcheck` 里对着同一张 `.webp` 跑一次
+`Image.FromStream` 就能拿到结论 —— 实测输出
+`抛异常（ArgumentException）—— 绕开 ImageLoader 的读图点都会变黑`。
+
+> 所以：**新增任何"从磁盘读图"的代码之前，先搜一遍 `Image.FromStream` / `Image.FromFile`。**
+> 离线自检里有一条 `--- asset preview thumbnails ---`，对素材目录里**每一张**素材断言
+> "出得来缩略图"且"不是一块死色"（纯底色正是加载失败退化的样子，而它**不抛异常**，
+> 只断言"没报错"抓不出来），并导出 `_asset_thumbs.png` 拼版图供目视。
+
 #### 怎么确认它解得对
 
 - **逐像素对拍**：同一张 `.webp` 分别用本程序解、用 Pillow(libwebp) 解，逐像素求平均绝对误差。
@@ -772,8 +798,15 @@ GDI+ 的 `AddArc` 也是"从 +x 轴出发、屏幕上顺时针为正"，可以�
 **没写进 JSON 的图片也会照样出现在列表里**（属性全是默认 false、opacity=1），
 所以往目录里丢一张图就能直接用，不必先改 JSON。
 
+支持的格式和底图一样：`png / jpg / jpeg / gif / webp / bmp`，**按文件头分派**
+（`AppEnv.IsAllowedImage` 只做扩展名初筛，真正解码走 `ImageLoader`）。
+**webp 也完全支持**——列表里那一格预览缩略图和画到地图上的贴图走的是同一个入口，
+所以"地图上画得出来、预览里却是黑的"这种不对称不会出现（第十七轮修过一次，
+详见「底图格式」一节的规矩）。
+
 **不透明度**在生成贴图时就用 `ColorMatrix` **烘进位图**，之后画一格只是一次位块传送。
-素材原图 1254×1254、单张 1.3–3.3MB，手机一格才三四十 CSS 像素，
+素材原图 1254×1254；**早期是 PNG、单张 1.3–3.3 MB，第十七轮全部换成有损 WebP 后
+14 张合计只 1.6 MB**。手机一格才三四十 CSS 像素，
 所以手机端走 `/api/terrain/tile/…?px=64` 拿缩好的瓦片，流量从几十兆降到几十 KB。
 
 **落盘**：改动后 900ms（手停下来）写 `drawing.json`，同时只广播一个
@@ -902,7 +935,7 @@ win7版本/
 ├─ DrawOverlay.cs             绘图渲染：已落笔贴图的位块传送 + 选区（红覆盖格 + 蓝实际形状）/候选点/原点/距离读数的叠加
 ├─ SidebarPanel.cs            左侧工具栏（自绘，宽窄动画不闪烁，按钮内缩随宽度插值；最后一颗贴底）
 ├─ UpdateDialog.cs            更新提示框（三按钮：更新/下次一定/不再提示）+ 统一样式的提示框 + 后台等待框
-├─ SelfCheck.cs               完全离屏的自检渲染（不开窗口、不起服务，含旋转 / 绘图几何 / 笔刷形状 / 锚点 / WebP 解码 / 侧栏底部按钮）
+├─ SelfCheck.cs               完全离屏的自检渲染（不开窗口、不起服务，含旋转 / 绘图几何 / 笔刷形状 / 锚点 / WebP 解码 / **素材缩略图** / 侧栏底部按钮）
 ├─ Properties/
 │  └─ AssemblyInfo.cs
 ├─ Resources/
@@ -918,7 +951,9 @@ win7版本/
 │  ├─ Models.cs               数据模型 + 网卡枚举 + **只读文件头**的图片尺寸读取（含 WebP）
 │  ├─ MapStore.cs             底图列表 / 切换 / 上传 / MD5 去重 / 旋转角 / 网格颜色模式
 │  ├─ MapTone.cs              底图色调采样（32×32 降采样 + Rec.601 平均亮度）与缓存
-│  ├─ ImageLoader.cs          按**文件头**分派解码：WebP 走自研 VP8，其余交给 GDI+（见「底图格式」一节）
+│  ├─ ImageLoader.cs          按**文件头**分派解码：WebP 走自研 VP8，其余交给 GDI+；
+│  │                          另有 `LoadThumbnail()`——底图列表与素材列表**共用**的缩略图入口
+│  │                          （凡读图都必须从这里走，见「底图格式」一节）
 │  ├─ Vp8Decoder.cs           手写纯托管 VP8（WebP lossy）解码器：RFC 6386 全流程
 │  ├─ Vp8Tables.cs            VP8 的全部概率表与树表（与 RFC 6386 附录源码逐元素核对过）
 │  ├─ TerrainCatalog.cs       绘图素材目录（terrain/entity/item 扫描 + JSON 属性合并）
@@ -934,8 +969,10 @@ win7版本/
 │  └─ QrCodeGenerator.cs      手写 QR 码生成（v1–10，纠错级 M）
 ├─ scripts/
 │  ├─ build.ps1               编译脚本（-Configuration / -SelfTest / -SelfCheck）
+│  ├─ build_installer.ps1     只编安装器（-Preview 另编一份 asInvoker 版并截图 + 跑布局/流程断言）
 │  ├─ make_release.ps1        出发布包：编译三个工程 → releases\ 三类产物 + 源码 zip + 功能自检
-│  ├─ _msbuild.ps1            共用的小工具：定位 MSBuild（被 build.ps1 / make_release.ps1 点源）
+│  ├─ probe_click.ps1         编跑 installer\probe_click\：用真实窗口消息证明"一次点击 = 一次 Click"
+│  ├─ _msbuild.ps1            共用的小工具：定位 MSBuild（被三个构建脚本点源）
 │  ├─ smoke_test.ps1          端到端冒烟测试（JSON 请求体一律走 Post-Json 发 UTF-8 字节）
 │  ├─ auth_test.ps1           令牌 / 房间锁 / 改端口测试
 │  ├─ ui_shot.ps1             无人值守界面截图（-Mode all 一个进程截 15 张，-Height 可压窗口高度）
@@ -946,10 +983,19 @@ win7版本/
 │  └─ make_icon.py            开发期辅助：把根目录 图标.png 转成多尺寸 appicon.ico（见第 3 节）
 ├─ installer/                 安装 / 卸载程序（独立工程，见第 14 节）
 │  ├─ TrpgMapsSetup.csproj    v3.5 / x86；app.manifest 声明 requireAdministrator
-│  ├─ Program.cs              入口：/uninstall、/quiet、/selftest
-│  ├─ SetupForm.cs            界面 + SetupEngine（真正的安装/卸载动作）
+│  ├─ Program.cs              入口：/uninstall、/quiet、/selftest、/uipreview
+│  ├─ SetupUi.cs              **自绘控件库**：胶囊选项行 / 按钮 / 输入框 / 细进度条 / 日志面板
+│  ├─ SetupForm.cs            界面（全自绘向导）+ SetupEngine（真正的安装/卸载动作）
 │  ├─ app.manifest            要求管理员权限 + DPI 感知 + 支持的系统列表
+│  ├─ app.preview.manifest    同上但 asInvoker：**只给截图自检用**（见下）
+│  ├─ probe_click/            独立小工程：复现 / 守住 "Control 默认 StandardClick 导致一次点击发两次 Click"
 │  └─ payload.zip             内嵌的程序负载（构建前由 make_release.ps1 现打，不进版本库）
+│
+│  嵌入资源两个（见 csproj）：
+│    TrpgMaps.payload.zip     ← payload.zip
+│    TrpgMaps.appicon.ico     ← ..\Resources\appicon.ico，**运行时的窗口/任务栏图标**
+│       ⚠️ ApplicationIcon 只管 exe 文件图标；Form.Icon 必须自己赋（见 14.9）
+│       单文件 + 卸载器是 exe 副本 ⇒ 图标必须编进程序集，不能去磁盘找 Resources\
 ├─ updater/                   升级器（独立工程，见第 14 节）
 │  ├─ TrpgMapsUpdater.csproj  只链四个 Core 文件，编出来几十 KB
 │  └─ Program.cs              --apply / --delete-only / --register-only / --test-zip
@@ -1299,6 +1345,14 @@ powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -SelfCheck
    **② 亮度标准差 ≥ 0.02、不同亮度级数 ≥ 24**（不是一片糊 / 不是纯色）；
    **③ 不是全黑也不是全白**。同时打印每张的解码耗时，并把第一张导出成 `_webp_decode.png`
    供目视，另外导出 `_webp_y/u/v.raw` 三个平面原始数据，方便跟 libwebp 逐像素对拍。
+11. **素材预览缩略图**（`--- asset preview thumbnails ---`）：对 `terrain\` / `entity\` / `item\`
+   里**每一张**素材跑一次**与绘图面板完全相同的** `ImageLoader.LoadThumbnail()`，断言
+   **① 出得来图**、**② 不是一块死色**（亮度标准差 ≥ 0.02、级数 ≥ 8）。
+   第二条是关键：缩略图加载失败时**不会抛异常**，只是退化成一块 `Theme.Background` 底色
+   —— 那正是"素材预览全是黑的"的样子，只断言"没报错"根本抓不出来。
+   顺带打印一行反证：对同一张 `.webp` 直接跑 `Image.FromStream`，
+   实测输出 `抛异常（ArgumentException）`，把"为什么必须有统一入口"钉成可复现的结论。
+   并把全部缩略图拼成 `_asset_thumbs.png`（带文件名）供目视。
 
 > 为什么颜色判定用**相对中位数偏差**而不是固定阈值：白线画在 0.93 的亮底上，
 > 线本身也只有 0.985 —— 只比底色亮 0.06，任何"亮于 0.8 算可见"的绝对阈值都会判错。
@@ -1726,11 +1780,24 @@ powershell -ExecutionPolicy Bypass -File scripts\make_release.ps1
 
 字段不重叠，故意分成两个类型（`UpdateManifest` / `UpdateManifestFile`），混着用容易看错。
 
-`update.json` 的 `deleteFiles` 里现在列的是**19 张早期版本随包发布的 PNG 底图**：
-它们后来被体积只有 1/20 的 `.webp` 取代，老版本升上来之后那些 PNG 会白占 50 MB。
+`update.json` 的 `deleteFiles` 里现在列的是**早期版本随包发布的 PNG 素材**（33 个）：
+
+| 目录 | 个数 | 为什么被淘汰 |
+|---|---|---|
+| `maps\` | 19 | 底图 PNG 合计 50 MB，第十二轮换成 `.webp` 后只要 2.7 MB |
+| `terrain\` | 14 | 地形素材 PNG 合计约 31 MB，第十七轮换成 `.webp` 后只要 1.6 MB |
+
 清单**只列这些确切文件名**，用户自己上传的图片一张都不会动。
-这份清单在 `make_release.ps1` 里是**从 `maps\` 目录现推的**（`X.webp` → `maps/X.png`），
-不是硬编码 —— 两头对不上时能自己发现。
+这份清单在 `make_release.ps1` 里是**从四个素材目录现推的**（`X.webp` → `<dir>/X.png`），
+不是硬编码 —— 两头对不上时能自己发现（发布自检里有逐目录的条数断言）。
+
+> 🔴 **绝不"只删不补"。** 每一个出现在 `deleteFiles` 里的目录，其替代文件**必须同时在
+> `payload\` 里**。否则升级程序把老 PNG 删掉、新 webp 又没发下来，用户会得到一个
+> **空目录**（地形/底图全没了）。第十七轮差点就是这样：默认的升级包**只带程序文件**
+> （美术素材刻意不发，避免升级包变胖），而删除清单却已经指向 `terrain\*.png`。
+> 现在 `make_release.ps1` 会把"这次要删的目录"**强制塞进 payload**（`-FullUpdate` 则全塞），
+> 并在自检里断言 `payload` 确实补上了 —— 见第 14.7 节的
+> `update payload replaces <dir>`。
 
 ### 14.7 发布前自检（`make_release.ps1` 第 5 步里那段）
 
@@ -1743,7 +1810,9 @@ powershell -ExecutionPolicy Bypass -File scripts\make_release.ps1
 | 条目名里没有反斜杠、中文名按 UTF-8 正确往返 | 打包工具写错分隔符 / 编码 |
 | 安装器 exe 里确实嵌了 `TrpgMaps.payload.zip`，且体积 ≥ 负载 | `LogicalName` 写错 → 装出来是个空壳 |
 | `放行防火墙.bat` 确实在 portable 与 update 包里（按 UTF-8 名字做字节搜索） | 漏拷 → 用户按 Readme 去双击一个不存在的文件 |
-| `delete.bat` 路径：列出的 19 个文件**全被删掉**、用户上传的图片**没被动**、没列的文件**没被动** | 删除清单写错 → 删掉用户的地图 |
+| `delete.bat` 路径：列出的文件**全被删掉**、用户上传的图片**没被动**、没列的文件**没被动** | 删除清单写错 → 删掉用户的地图 |
+| **删除清单逐目录覆盖**（`delete list covers <dir> PNGs: n of n`） | 某个素材目录漏进清单 → 升级后同名 `.png` / `.webp` 各列一遍 |
+| **删除必须补上**（`update payload replaces <dir>`） | **只删不补 → 升级后目录变空**（第十七轮的真坑） |
 | `--apply` 路径：payload 落到目标目录、`TrpgMapsUpdater.exe` 自己**不会**被拷进安装目录、用户数据仍在 | 覆盖范围写错 |
 
 另外还有两个**需要管理员**的入口，只能人工跑：
@@ -1786,4 +1855,133 @@ win32\         工程本体 = 本机 win7版本\ 的内容
 所以它们现在分别待在 `win32\` 与外层，正好不会再互相覆盖。
 
 `版本说明.md`、`开发须知.md`、`签名说明.md` 都不进那个 zip。
+
+### 14.9 安装器界面的自检通道（`/uipreview` + `build_installer.ps1 -Preview`）
+
+安装器界面是**全自绘**的，没有 HTTP 接口、没有可断言的返回值，改一行坐标就可能
+把按钮画到窗口外。所以有一条专门的自检通道：
+
+```
+powershell -File scripts\build_installer.ps1 -Preview
+```
+
+它做三件事：
+
+1. **另编一份** `installer\bin\Preview\`，用 `app.preview.manifest`（`asInvoker`）。
+   ⚠️ 必须另编：Windows 是**在跑托管代码之前**按清单里的 `requireAdministrator`
+   决定弹不弹 UAC 的 —— 主清单不动的话，连截图模式都会弹 UAC，无人值守直接挂死。
+2. 跑 `TrpgMapsSetup.exe /uipreview <目录>`：把向导的 6 种视觉状态各抓一张 PNG，
+   用 Win32 `PrintWindow` + `PW_RENDERFULLCONTENT`（`DrawToBitmap` 对自绘控件返回空白）。
+   抓图前先把窗口挪到 `(-32000,-32000)`，否则真实鼠标停在窗口上会污染悬浮态。
+3. 跑两条**可机读的断言**，任一 `FAILED` 则退出码非 0：
+
+| 断言 | 方法 | 抓什么 |
+|---|---|---|
+| 布局 | `SetupForm.PreviewLayoutReport()` | 可见控件是否越界；当前页内容是否压住页脚提示行 |
+| 向导流程 | `SetupForm.PreviewWizardFlowReport()` | **只点一次** `OnPrimary()`，断言停在 `_page==1` 且未进入 busy |
+
+`PreviewWizardFlowReport` **刻意只点一次** —— 第二次点下去就是真的开始安装了。
+
+另外 `scripts\probe_click.ps1` 是一个独立的最小复现工程（`installer\probe_click\`），
+用 `SendMessage(WM_LBUTTONDOWN/WM_LBUTTONUP)` 走真实消息路径，
+证明"一次物理点击只发一次 `Click`"。
+
+> **为什么这两条断言值得单独存在**：第十五轮踩到的三个 bug（点下一步直接开装、
+> 卸载窗口不是圆角、卸载按钮看不见）**在截图里几乎看不出来** ——
+> 控件跑到可视区外只是"少了几个按钮"（看着像故意留白），内容互相压住只是"文字有点糊"。
+> 只有让程序自己算边界、自己数点击次数，才能不看图就下结论。
+
+#### 安装器的窗口图标（容易漏）
+
+`csproj` 里的 `<ApplicationIcon>` **只写进 exe 文件的 PE 资源段** ——
+它让**资源管理器**里的 exe 好看，**但不影响运行中的窗口**。窗口图标是 `Form.Icon`，
+不显式赋值就是系统默认那个空白图标（任务栏 / Alt+Tab 里一眼能看出不对）。
+
+安装器还必须**从程序集资源**读图标，不能像主程序那样读磁盘上的 `Resources\appicon.ico`：
+安装器是**单文件**发布的，卸载器更是安装器 exe 的**副本**（落在安装目录里，旁边不保证有
+`Resources\`）。所以 csproj 里同一份 `.ico` 挂了两次：
+
+| 位置 | 作用 |
+|---|---|
+| `<ApplicationIcon>` | PE 资源段 → 资源管理器 / exe 文件图标 |
+| `<EmbeddedResource ... LogicalName="TrpgMaps.appicon.ico">` | 运行时读得到 → **窗口 / 任务栏图标** |
+
+`SetupForm.ApplyAppIcon()` 从资源流取 256 → 48 → 32 逐级降级，
+再退到 `Icon.ExtractAssociatedIcon(exe)`，最后才保持系统默认。
+
+### 14.10 `open\` 发布树与一键上传（`tools\upload_git.py`）
+
+发布不只是"出几个文件"，还要**把源码树同步到 Gitee / GitHub**。
+这两件事现在由发布脚本串起来：
+
+```
+win7版本\scripts\make_release.ps1 -Sign     # 出包；最后把源码包解压进 工作区根\open\
+一键上传git.bat                             # 双击即可；或 git bash 里  ./一键上传git.bat
+```
+
+#### `open\` 是"产物"，不是"工作区"
+
+`open\` = **源码 zip 解压到磁盘上的样子**，它就是上传脚本要推的那棵工作树。
+所以有一条铁律：**别手改 `open\` 里的任何东西**，要改就改工作区根的 `Readme.md`
+（模板）或 `win7版本\` 里的源码，然后重跑 `make_release.ps1`。
+
+每次发布都会**按 zip 的内容重建** `open\`：
+
+| 行为 | 为什么 |
+|---|---|
+| zip 里有、`open\` 里没有 → 写入 | 新文件 |
+| 两边都有 → 覆盖 | 改过的文件 |
+| `open\` 里有、zip 里没有 → **删掉** | 否则从项目里删掉的素材会一直躺在 `open\`、被重新提交、在仓库里复活 |
+| `open\.git\` → **保留** | 那是上传脚本推的本地克隆 |
+
+没用 `ZipFile::ExtractToDirectory`：它在目标目录非空时直接拒绝，而且**表达不了"删掉 zip 里已经没有的东西"**。
+自己写的 `Expand-ZipInto` 才能"就地覆盖 + 扫尾"。
+解压走 BCL 的 zip 读取器是安全的 —— 自研 `New-Zip` 给每个条目都写了 UTF-8 语言编码标志（`0x800`），
+实测 118 / 118 个条目名（含中文）与 Python `zipfile` 解出来的完全一致。
+
+#### 上传脚本干了什么
+
+| 步骤 | 做法 | 为什么这么做 |
+|---|---|---|
+| 读版本号与仓库地址 | 从 `Core\AppInfo.cs` 正则取 `Version` / `Author` / `GiteeRepo` / `GitHubRepo` | 那几个常量本来就各只有一处，脚本再写一份就是多出来的第二处，改一处忘一处 |
+| 决定分支 | `ls-remote --symref` 拿远端 `HEAD`，再退 `main` / `master` | 空仓库 / 已存在的仓库都不用改脚本 |
+| **不 checkout** | 临时索引（`GIT_INDEX_FILE=open\.git\upload_index`）+ `git commit-tree` | `open\` 里**就是**要提交的东西；checkout 会把刚解压的树冲成远端的样子 |
+| 两个远端各造一个提交 | 提交挂在**它自己远端最新提交**之上，`-m` 就是版本号 | 永远快进推送，**不需要 `--force`** |
+| 内容同步 | 树按 `open\` 当前内容**整棵**建 | 新增 / 覆盖 / 删除全交给 git：远端多出来的删、少掉的补、改过的覆盖 |
+| Readme 域名对调 | 三步换位（`gitee.com`→哨兵，`github.com`→`gitee.com`，哨兵→`github.com`） | 同时换两个域名才不会互相踩；**只动链接、不动正文** —— 正文里"更新源优先 Gitee"说的是程序行为 |
+| 收尾 | 把 `open\Readme.md` 还原成 Gitee 那份 | 让 `open\` 始终等于源码包的内容 |
+
+`fetch` / `push` 是**直接继承终端**跑的（不抓输出），所以 git 自己弹凭据窗口、问口令都照常，
+验证一次之后 git 会记住。
+
+#### 两个坑（都补了护栏）
+
+**① `core.autocrlf=true` 会改写你要发布的东西。**
+Git for Windows 的常见默认是 `true`，那样 `git add` 会把工作区里的 CRLF **悄悄改成 LF** 再存 ——
+于是 clone 出来的树和发布的源码包对不上，更麻烦的是**提交哈希会跟着每个人的机器设置变**
+（同一个版本，两个人推出来两个不同的提交）。发布仓库要的是可复现，所以在 `open\` 里设
+**仓库级** `core.autocrlf=false`（只影响这个仓库，不碰全局设置）。
+项目里本来就有 6 个文件是 CRLF（`win32\README.md`、`SelfCheck.cs`、`Core\DrawingStore.cs`、
+`Core\Vp8Tables.cs`、`terrain\terrain_properties.json`、生成的 `version.json`），
+**不做"统一成 LF"的美化** —— 源码包长什么样，仓库里就长什么样。
+
+**② `.gitignore` 写错一个通配符 = 文件静默地不提交。**
+git 不会报错，发布出去才发现少东西。所以 `verify_tree()` 会数一遍：
+**提交树里的文件数必须等于 `open\` 里的文件数**，多一个少一个都直接报错退出。
+
+#### 怎么验证"仓库 = 源码包"
+
+`gitee` 那个提交是**逐字节等于源码包**的（`Readme.md` 也一样），`github` 那个只差 `Readme.md` 一个文件
+（就是换过域名的那份）。这条可以用 git 的 blob 哈希直接证明 —— 源包 ≡ `open\` ≡ 提交对象：
+
+```
+python -c "..."   # 对每个文件算 sha1('blob <len>\0' + 内容)，与 git ls-tree 的哈希逐个比
+```
+
+实测（v1.0.1）：`gitee/master` **0 个文件不同**，`github/master` 只有 `Readme.md` 不同；
+CRLF 文件在仓库里仍是 CRLF（`Vp8Tables.cs` 1216 个 CRLF / 41,900 B，与源一致）。
+
+> **注意**：`一键上传git.bat` 和 `tools\upload_git.py` 在**工作区根**，不在 `win7版本\` 里 ——
+> 它们操作的是 `open\`，本来就跨版本目录。
+
 

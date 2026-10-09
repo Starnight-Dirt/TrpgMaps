@@ -21,7 +21,7 @@ namespace TrpgMaps
         /// 当前版本号，**不带 v 前缀**。带前缀的写法统一用 <see cref="VersionText"/>。
         /// 只允许 "数字.数字.数字" 这种形式（更新比较是按段比数字，不支持 -beta 后缀）。
         /// </summary>
-        public const string Version = "1.0.0";
+        public const string Version = "1.0.1";
 
         /// <summary>作者 / 发布者。</summary>
         public const string Author = "starnight-dirt";
