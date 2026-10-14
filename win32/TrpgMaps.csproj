@@ -121,6 +121,8 @@
     <Compile Include="Core\TerrainImageCache.cs" />
     <Compile Include="Core\DrawingStore.cs" />
     <Compile Include="Core\GameState.cs" />
+    <Compile Include="Core\Room.cs" />
+    <Compile Include="Core\PortPicker.cs" />
     <Compile Include="Core\RealtimeHub.cs" />
     <Compile Include="Core\MiniJson.cs" />
     <Compile Include="Core\HttpServer.cs" />

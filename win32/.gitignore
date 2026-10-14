@@ -13,6 +13,8 @@ installer/payload.zip
 app.log
 drawing.json
 TrpgMapsUpdater.log
+# 房间号与**房间密码**（见 Core\Room.cs）：只属于本机这一次运行，绝不能进版本库
+room.json
 
 # ---- 编辑器 / 工具 ----
 .vs/

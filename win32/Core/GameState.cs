@@ -145,6 +145,60 @@ namespace TrpgMaps
             }
         }
 
+        /// <summary>
+        /// 这名玩家presented的令牌是不是对的（名册里有这个名称 + 令牌一致）。
+        ///
+        /// 登录时用来决定"要不要再问一次房间密码"：**凭令牌认出来的老玩家直接放行**，
+        /// 只有陌生人才需要密码 —— 密码保护的是"这个房间谁能进来"，
+        /// 而令牌已经证明了他就是名册里那个人。
+        /// </summary>
+        public bool HasValidToken(string name, string token)
+        {
+            name = (name ?? string.Empty).Trim();
+            token = token ?? string.Empty;
+            if (name.Length == 0 || token.Length == 0) return false;
+
+            lock (_gate)
+            {
+                PlayerEntry entry;
+                return _players.TryGetValue(name, out entry) && FixedTimeEquals(entry.Token, token);
+            }
+        }
+
+        /// <summary>
+        /// **退出房间**：把这条记录整个从名册里删掉（= 同时清掉"这个房间对这名玩家的记忆"，
+        /// 他的令牌也就跟着作废了）。令牌不对 / 名册里没这个人都不动任何东西。
+        ///
+        /// 和 <see cref="Kick"/> 的区别：踢人只把条目挂起来（<c>Online=false</c>、
+        /// <c>Kicked=true</c>），带原令牌还能再进来；退出是**真删**，下次得从头加入。
+        /// </summary>
+        public LeaveResult Leave(string name, string token)
+        {
+            name = (name ?? string.Empty).Trim();
+            token = token ?? string.Empty;
+
+            if (name.Length == 0) return LeaveResult.Fail(LoginCodes.EmptyName, "玩家名为空");
+
+            lock (_gate)
+            {
+                PlayerEntry entry;
+                if (!_players.TryGetValue(name, out entry))
+                    return LeaveResult.Fail(RoomCodes.NotFound, "名册里没有这名玩家");
+
+                if (token.Length == 0 || !FixedTimeEquals(entry.Token, token))
+                    return LeaveResult.Fail(LoginCodes.TokenMismatch, "身份校验失败（令牌不匹配）");
+
+                _players.Remove(name);
+                return new LeaveResult
+                {
+                    Success = true,
+                    Name = name,
+                    Message = name + " 已退出房间",
+                    ConnectionId = entry.ConnectionId
+                };
+            }
+        }
+
         /// <summary>按名称踢出，返回其连接 ID；名册条目保留，带原令牌仍可重进。</summary>
         public string Kick(string name)
         {
@@ -174,13 +228,9 @@ namespace TrpgMaps
         /// <summary>常数时间字符串比较，避免时序侧信道。</summary>
         private static bool FixedTimeEquals(string a, string b)
         {
-            var ba = Encoding.UTF8.GetBytes(a ?? string.Empty);
-            var bb = Encoding.UTF8.GetBytes(b ?? string.Empty);
-            if (ba.Length != bb.Length) return false;
-
-            var diff = 0;
-            for (var i = 0; i < ba.Length; i++) diff |= ba[i] ^ bb[i];
-            return diff == 0;
+            // 实现放在 RoomState 里：房间密码也要用同一份比较逻辑，
+            // 免得两处各写一遍、改了一处漏另一处。
+            return RoomState.FixedTimeEquals(a, b);
         }
     }
 }

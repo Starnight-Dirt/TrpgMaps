@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>玩家端朝向夹具（开发工具）</title>
+<link rel="stylesheet" href="../wwwroot/css/player.css">
+<script>
+/*
+ * 玩家端朝向的**目视**夹具（开发工具，不参与打包，也不会被内置 Web 服务器发出去）。
+ *
+ * 把实时通道 / 后端 / 登录全换成桩，唯一没换的就是真的 player.js —— 用来在
+ * 真浏览器里看它到底把地图摆成什么样（逻辑数值看 scripts\probe_player_orientation.js）。
+ *
+ * 用法（在 win7版本\ 目录下起一个静态服务器，别用 file://，cookie 与相对路径都会别扭）：
+ *
+ *   python -m http.server 8765 --bind 127.0.0.1
+ *   http://127.0.0.1:8765/scripts/player_orientation_fixture.html?wo=180
+ *
+ * 命令行截图（Edge / Chrome 都有）：
+ *
+ *   msedge --headless=new --disable-gpu --hide-scrollbars --virtual-time-budget=6000 ^
+ *          --window-size=400,800 --screenshot=shot.png "<上面的地址>"
+ *
+ * 参数：
+ *   wo=<0|90|180|-90>             window.orientation（设备相对"正放"转了多少）
+ *   o=<screen.orientation.type>   landscape-primary / landscape-secondary /
+ *                                 portrait-primary / portrait-secondary
+ *   a=<screen.orientation.angle>  0 / 90 / 180 / 270
+ *   rot=<电脑端设定的顺时针角度>   0/90/180/270，默认 0
+ *   gc=<white|black>              网格线颜色，默认 black（亮底图上看得清）
+ *   nomap=1                       模拟"电脑端还没设底图"：不给底图，但照样下发锚点
+ *   anchor=0                      连锚点也不给（老版本电脑端），退回等距老网格
+ *   map=<底图路径>                 默认 ../maps/草地.webp
+ *   cw=<宽> ch=<高>                假装**电脑端画布**的像素尺寸，默认 1200x720
+ *   sw=<宽> sh=<高>                假装设备屏幕尺寸，默认 = 视口（无头浏览器会用
+ *                                  自己的默认值把 screen 报成 800x600，得盖掉）
+ *   extra=<deg>                   透传给 player.js 的**叠加微调**（默认 0；180 = 翻面）
+ *   box=fill                      透传 `?box=fill`：内容铺满屏幕（裁边缘、一屏格数变少）
+ *   debug=1                       透传给 player.js，左下角出朝向读数
+ *                                 （第二十三轮起）读数会说明 extra 是按
+ *                                 "长边贴长边：视口竖→90 / 横→0" 取的）
+ *
+ * 夹具会按"电脑端画布 1200x720、一格 60px"这套基准**现算**锚点：
+ *   halfW/halfH = 画布 / (2×60)；底图按 cover 铺进画布后再算 cellsX/cellsY。
+ * 这样截出来的图才和真机上的一致（盒子 = 画布比例、格子 = 60px × 缩放）。
+ *
+ * ⚠️ 第二十三轮起，**正确的姿态对照**是（只看视口方向，两个值）：
+ *     竖视口（正立 wo=0 / 倒立 wo=180）      → extra 90
+ *     横视口（向左横排 wo=90 / 向右横排 wo=-90）→ extra 0  ← 等于电脑画布那张脸
+ *   不需要区分"向左 / 向右横排"，也不看设备转角。
+ *
+ * 想对比"改之前"的版本：把旧 player.js 复制成 wwwroot\js\player_other.js，
+ * 再把下面的 <script src> 指过去即可（**不要**用 document.write 动态拼 —— 实测
+ * 无头 Edge 下那条路不会执行，会得到一张全黑的图，白排查半天）。
+ */
+(function () {
+    var q = new URLSearchParams(location.search);
+
+    // 必须在 player.js 读它之前换掉。window.orientation 可能是只读属性，用
+    // defineProperty 换；失败就退回直接赋值。
+    if (q.get('wo') !== null) {
+        var wo = parseInt(q.get('wo'), 10);
+        try {
+            Object.defineProperty(window, 'orientation', { value: wo, configurable: true });
+        } catch (e) {
+            try { window.orientation = wo; } catch (e2) { /* 只读就被忽略 */ }
+        }
+    }
+
+    var fake = {
+        type: q.get('o') || 'portrait-primary',
+        angle: parseInt(q.get('a') || '0', 10),
+        addEventListener: function () {},
+    };
+    try {
+        Object.defineProperty(window.screen, 'orientation', { value: fake, configurable: true });
+    } catch (e) {
+        window.screen.orientation = fake;
+    }
+
+    // 夹具假装"设备屏幕 = 视口"（真机上两者只差浏览器的地址栏）。不这么做的话，
+    // 无头浏览器会把 screen 报成它自己的默认值（比如 800x600），盒子就跟着失真，
+    // 截出来的图不能用来判断布局。需要时用 sw/sh 显式指定。
+    var sw = parseInt(q.get('sw') || String(window.innerWidth), 10);
+    var sh = parseInt(q.get('sh') || String(window.innerHeight), 10);
+    try {
+        Object.defineProperty(window.screen, 'width', { value: sw, configurable: true });
+        Object.defineProperty(window.screen, 'height', { value: sh, configurable: true });
+    } catch (e) { /* 换不动就算了 */ }
+
+    var listeners = {};
+    window.__err = '';
+    window.onerror = function (msg) { window.__err = String(msg); };
+    window.__emit = function (ev, data) {
+        (listeners[ev] || []).forEach(function (h) {
+            try { h(data); } catch (e) { window.__err = e.message; }
+        });
+    };
+    window.io = function () {
+        return {
+            on: function (ev, h) { (listeners[ev] = listeners[ev] || []).push(h); },
+            emit: function () {},
+            connected: true,
+            reconnect: function () {},
+        };
+    };
+    window.fetch = function () {
+        return Promise.resolve({ json: function () { return Promise.resolve({ cells: [] }); } });
+    };
+
+    window.__cfg = {
+        nomap: q.get('nomap') === '1',
+        map: q.get('map') || '../maps/草地.webp',
+        rot: parseInt(q.get('rot') || '0', 10),
+        gc: q.get('gc') || 'black',
+        noAnchor: q.get('anchor') === '0',
+        // 假装电脑端：画布 cw x ch 像素，一格 60px（= 2.5cm/格 × 37.8 -ish）
+        cw: parseInt(q.get('cw') || '1200', 10),
+        ch: parseInt(q.get('ch') || '720', 10),
+        cell: 60,
+    };
+})();
+</script>
+</head>
+<body>
+<!-- 夹具把登录层藏掉，只留地图；工具栏保留（它本来就会压住地图上沿 40px） -->
+<div id="login-overlay" style="display:none"><div id="login-box">
+  <h2>加入游戏</h2><div id="room-lock-notice"></div>
+  <input id="player-name-input" value="夹具"><button id="login-btn">进入</button>
+  <div id="login-error" class="error"></div><div id="login-info" class="info"></div>
+</div></div>
+<div id="player-toolbar" style="display:flex"><span>👤 <span id="display-player-name" class="player-name">夹具</span></span>
+  <span class="status" id="connection-status">● 在线</span></div>
+<div id="player-map-container"><div id="player-map-wrapper">
+  <img id="player-map-image" alt="地图">
+  <canvas id="player-draw-canvas"></canvas>
+  <canvas id="player-grid-canvas"></canvas>
+</div></div>
+<div id="probe" style="position:fixed;right:0;top:44px;z-index:5000;pointer-events:none;
+     background:rgba(0,0,0,.78);color:#ff0;font:13px/1.6 Consolas,monospace;padding:6px 8px;white-space:pre"></div>
+
+<!-- 必须是静态标签：动态写进来的那条在无头浏览器里不会执行 -->
+<script src="../wwwroot/js/player.js"></script>
+<script>
+/**
+ * 按"电脑端画布 cw x ch、一格 cell px"这套基准现算锚点，再当作 map_change 发下去。
+ * 对齐的是真机的语义：
+ *   halfW / halfH = 画布半宽/半高各是几格（= 盒子比例的依据）
+ *   cellsX / cellsY = 底图按 cover 铺进画布之后的宽/高是几格
+ *                     （没底图时改发画布本身：2*halfW / 2*halfH）
+ */
+function emitMapChange() {
+    var cfg = window.__cfg;
+    var img = document.getElementById('player-map-image');
+    var hw = cfg.cw / (2 * cfg.cell);
+    var hh = cfg.ch / (2 * cfg.cell);
+    var cx = hw * 2, cy = hh * 2;
+    if (!cfg.nomap && img.naturalWidth > 0) {
+        var cover = Math.max(cfg.cw / img.naturalWidth, cfg.ch / img.naturalHeight);
+        cx = img.naturalWidth * cover / cfg.cell;
+        cy = img.naturalHeight * cover / cfg.cell;
+    }
+    window.__anchor = { cx: cx, cy: cy, hw: hw, hh: hh };
+    window.__emit('map_change', {
+        url: cfg.nomap ? '' : cfg.map,      // 没底图，但锚点照样下发（= 新版电脑端的行为）
+        rotation: cfg.rot,
+        mode: 'fill',
+        gridColor: cfg.gc,
+        drawingVersion: 1,
+        gridCellsX: cfg.noAnchor ? undefined : cx,
+        gridCellsY: cfg.noAnchor ? undefined : cy,
+        gridHalfW: cfg.noAnchor ? undefined : hw,
+        gridHalfH: cfg.noAnchor ? undefined : hh,
+    });
+}
+
+window.addEventListener('load', function () {
+    var img = document.getElementById('player-map-image');
+    var cfg = window.__cfg;
+
+    var show = function () {
+        var wrap = document.getElementById('player-map-wrapper');
+        var host = document.getElementById('player-map-container');
+        var so = window.screen.orientation;
+        var wo = typeof window.orientation === 'number' ? window.orientation : '(无)';
+        var grid = document.getElementById('player-grid-canvas');
+        var a = window.__anchor || { cx: 0, cy: 0, hw: 0, hh: 0 };
+        var cellPx = a.hw > 0 ? (wrap.offsetWidth / (a.hw * 2)) : 0;
+        document.getElementById('probe').textContent =
+            'player.js ' + (window.__playerJsRev || '(未暴露)') + '\n' +
+            '视口 ' + host.clientWidth + 'x' + host.clientHeight +
+            '   屏幕 ' + window.screen.width + 'x' + window.screen.height + '\n' +
+            'window.orientation ' + wo + '   type ' + so.type + '  angle ' + so.angle + '\n' +
+            '内容盒子(旋转前) ' + wrap.offsetWidth + 'x' + wrap.offsetHeight +
+            '   网格画布 ' + grid.width + 'x' + grid.height + '\n' +
+            '电脑画布 ' + cfg.cw + 'x' + cfg.ch + ' / 一格 ' + cfg.cell + 'px' +
+            '   锚点 hw=' + a.hw.toFixed(2) + ' hh=' + a.hh.toFixed(2) +
+            ' cells=' + a.cx.toFixed(2) + 'x' + a.cy.toFixed(2) + '\n' +
+            '底图自然尺寸 ' + img.naturalWidth + 'x' + img.naturalHeight + '\n' +
+            'transform ' + wrap.style.transform + (window.__err ? '\nERR ' + window.__err : '');
+    };
+
+    var start = function () { emitMapChange(); show(); setTimeout(show, 400); };
+    if (cfg.nomap || (img.complete && img.naturalWidth)) start();
+    else {
+        img.addEventListener('load', start);
+        // 图挂了也要出读数，否则截图是一片空白没法判断
+        img.addEventListener('error', start);
+        setTimeout(start, 1500);
+    }
+});
+</script>
+</body>
+</html>

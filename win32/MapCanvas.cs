@@ -161,6 +161,55 @@ namespace TrpgMaps
             }
         }
 
+        // ============================================================
+        //  顶部胶囊提示条（"xxx 离开了房间"）
+        // ============================================================
+
+        private string _toastText = string.Empty;
+        private int _toastY = -60;
+
+        /// <summary>
+        /// 设置顶部正中的胶囊提示条（动画由 MainForm 的定时器推进）。
+        /// <paramref name="top"/> 给负数就是"藏到窗口上边之外"，文字给空串则整个不画。
+        ///
+        /// ⚠️ **只让顶部那一条失效**：整张画布重画要几十毫秒，而这个动画 15ms 一帧 ——
+        /// 每帧全画一遍会把动画拖成幻灯片。
+        ///
+        /// 画在画布上的理由：画布铺满整窗、而且是最底层的兄弟控件；胶囊是"屏幕正中"，
+        /// 面板贴在最左边，两者实际不会重叠（真重叠了会被面板盖住，可以接受）。
+        /// </summary>
+        public void SetToast(string text, int top)
+        {
+            text = text ?? string.Empty;
+            if (_toastText == text && _toastY == top) return;
+
+            _toastText = text;
+            _toastY = top;
+
+            var strip = new Rectangle(0, 0, Math.Max(1, Width), 80);
+            Invalidate(strip);
+        }
+
+        private void DrawToast(Graphics g)
+        {
+            if (_toastText.Length == 0) return;
+
+            var font = Ui.Font(10.5f);
+            var size = g.MeasureString(_toastText, font);
+            var w = (int)Math.Ceiling(size.Width) + 46;
+            var h = 34;
+            if (w > Width - 40) w = Math.Max(120, Width - 40);
+
+            var rect = new Rectangle((Width - w) / 2, _toastY, w, h);
+            if (rect.Bottom < 0 || rect.Top > Height) return;   // 还在窗口外面，不用画
+
+            Ui.PrepareShape(g);
+            Ui.FillRounded(g, rect, h / 2f, Color.FromArgb(238, 26, 26, 28));
+            Ui.PrepareText(g);
+            Ui.DrawText(g, _toastText, font, Color.FromArgb(242, 242, 242), rect,
+                ContentAlignment.MiddleCenter);
+        }
+
         /// <summary>设置底图。filePath 为 null 表示只显示网格。</summary>
         public void SetMap(string filePath, int pixelWidth, int pixelHeight, string mode)
         {
@@ -365,6 +414,10 @@ namespace TrpgMaps
                     }
                 }
             }
+
+            // 顶部胶囊提示画在**最后**：它在遮罩之上（玩家退出时 DM 往往正开着面板，
+            // 提示不该被那层灰盖住），但仍在浮空面板之下（那是兄弟控件）。
+            DrawToast(g);
         }
 
         /// <summary>把原始底图重采样成和控件等大的一张位图（贵，只在必要时做）。</summary>

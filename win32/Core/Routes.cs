@@ -12,8 +12,10 @@ namespace TrpgMaps
     /// 实时推送走 SSE（/api/events），客户端动作用普通 POST。
     ///
     /// 权限划分：
-    ///  - 玩家可用：/player、静态资源、/api/events、/api/login、/api/request_map、/api/ping；
-    ///  - 仅本机 DM 可用：底图管理、玩家名单/踢人、房间锁定、IP/端口设置。
+    ///  - 玩家可用：`/`、`/player`、`/<房间号>/player`、静态资源、`/api/room`（只报房间号 +
+    ///    要不要密码）、`/api/events`、`/api/login`、`/api/leave`、`/api/request_map`、`/api/ping`；
+    ///  - 仅本机 DM 可用：底图管理、玩家名单/踢人、房间锁定、房间密码、IP/端口设置；
+    ///  - **只认回环**：`/api/network`（它带房间密码，见 <see cref="IsLoopback"/>）。
     /// </summary>
     internal sealed class Routes
     {
@@ -34,6 +36,9 @@ namespace TrpgMaps
         /// 跨线程安全，见 <see cref="GridAnchor"/>）。
         /// </summary>
         private Func<GridAnchor> _gridAnchorProvider;
+
+        /// <summary>「有玩家退出了房间」的界面回调（见 <see cref="AttachPlayerLeft"/>）。</summary>
+        private Action<string> _playerLeftCallback;
 
         // 二维码生成开销不小，而 /api/network 会被反复探测；按地址缓存
         private readonly object _qrGate = new object();
@@ -70,6 +75,26 @@ namespace TrpgMaps
             _gridAnchorProvider = provider;
         }
 
+        /// <summary>
+        /// 注入「有玩家退出了房间」的界面回调（DM 那边要弹一条胶囊提示条）。
+        ///
+        /// 为什么用回调而不是让界面去轮询：`/api/leave` 是**另一条线程**在处理，
+        /// 界面每 3 秒才刷一次名册（见 MainForm.RefreshPlayers），
+        /// 靠轮询的话"xxx 离开了房间"最多会晚 3 秒才出现，而且分不清是退出还是断线。
+        /// </summary>
+        public void AttachPlayerLeft(Action<string> callback)
+        {
+            _playerLeftCallback = callback;
+        }
+
+        private void NotifyPlayerLeft(string name)
+        {
+            var callback = _playerLeftCallback;
+            if (callback == null) return;
+            try { callback(name); }
+            catch (Exception ex) { AppLog.Write("通知界面「玩家退出」失败：" + name, ex); }
+        }
+
         // ============================================================
         //  分发
         // ============================================================
@@ -81,7 +106,7 @@ namespace TrpgMaps
 
             if (method == "GET" || method == "HEAD")
             {
-                if (path == "/" || path == "/player" || path == "/map")
+                if (IsPlayerPagePath(path))
                 {
                     return ServePage(ctx, "player.html");
                 }
@@ -92,7 +117,12 @@ namespace TrpgMaps
                     return ServeStatic(ctx, path.Substring(1));
                 }
                 if (path == "/api/events") return HandleEvents(ctx);
-                if (path == "/api/network") return Json(ctx, NetworkPayload());
+                if (path == "/api/room") return Json(ctx, RoomPayload(ctx));
+                // ⚠️ /api/network 现在带**房间密码**（玩家地址里就是它），所以必须只对本机开放：
+                //    以前它没设限，等于把整个地址连同密码告诉了局域网里任何人。
+                //    这里比其它 DM 接口更严：只认回环地址（IsLocal 在"地址读不到"时也算本机，
+                //    对带密码的接口太松）。
+                if (path == "/api/network") return IsLoopback(ctx) ? Json(ctx, NetworkPayload()) : Forbidden(ctx);
                 if (path == "/api/maps") return Json(ctx, MapsPayload());
                 if (path.StartsWith("/api/maps/size/", StringComparison.Ordinal))
                     return HandleMapSize(ctx, path.Substring("/api/maps/size/".Length));
@@ -112,6 +142,7 @@ namespace TrpgMaps
             if (method == "POST")
             {
                 if (path == "/api/login") return HandleLogin(ctx);
+                if (path == "/api/leave") return HandleLeave(ctx);
                 if (path == "/api/request_map") return HandleRequestMap(ctx);
                 if (path == "/api/ping") return HandlePing(ctx);
                 if (path == "/api/maps/set") return HandleSetMap(ctx);
@@ -122,11 +153,37 @@ namespace TrpgMaps
                 if (path == "/api/drawing/clear") return HandleDrawingClear(ctx);
                 if (path == "/api/players/kick") return HandleKick(ctx);
                 if (path == "/api/room/lock") return HandleRoomLock(ctx);
+                if (path == "/api/room/password") return HandleRoomPassword(ctx);
                 if (path == "/api/settings") return HandleSaveSettings(ctx);
             }
 
             ctx.WriteText(404, "{\"ok\":false,\"msg\":\"not found\"}");
             return false;
+        }
+
+        /// <summary>
+        /// 玩家页的地址形态。
+        ///
+        /// 新形态是 <c>/&lt;房间号&gt;/player</c>；<c>/</c>、<c>/player</c>、<c>/map</c>
+        /// 是老地址，继续发（老书签、老二维码还能用）。
+        ///
+        /// ⚠️ 房间号**对不上也照样把页面发出去**，不返回 404：
+        /// 页面自己会去 <c>/api/room</c> 问"现在这个房间是几号"，发现对不上就
+        /// 先向旧房间告辞、清掉 cookie，再以新玩家加入。返回 404 的话玩家只会
+        /// 看到一张白屏 —— 而他其实只是想进去玩。
+        /// </summary>
+        private static bool IsPlayerPagePath(string path)
+        {
+            // `/join`：手填房间号的登录页（内容和玩家页**完全同一份** player.html，
+            // 只是 player.js 认出这个路径后会多给一个"房间号"输入框，见那里的 joinMode）。
+            if (path == "/" || path == "/player" || path == "/map" || path == "/join") return true;
+
+            const string suffix = "/player";
+            if (path.Length <= suffix.Length || !path.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            // 只认 "/<一段>/player"：房间号那一段里不能再有斜杠
+            return path.IndexOf('/', 1) == path.Length - suffix.Length;
         }
 
         // ============================================================
@@ -493,9 +550,46 @@ namespace TrpgMaps
             return MiniJson.WriteObject(
                 "ip", _settings.ListenIp,
                 "port", _settings.Port,
+                "room", _settings.RoomNumber,
+                "roomHasPassword", _settings.RoomHasPassword,
                 "playerUrl", playerUrl,
                 "qrCode", BuildQr(playerUrl),
                 "roomLocked", _settings.RoomLocked);
+        }
+
+        /// <summary>
+        /// 公开的房间信息（玩家页开局问一次）：现在这个房间是几号、要不要密码。
+        ///
+        /// **只发"要不要密码"，不发密码本身** —— 这个接口谁都能调，
+        /// 密码只能来自二维码里的 query（<c>?passwd=</c>）或玩家手输。
+        /// 玩家页拿它来判断：地址栏里的房间号还是不是当前房间（不是就告辞重来）。
+        /// </summary>
+        /// <summary>
+        /// <c>/api/room</c> 的响应。公开接口（玩家端要用），所以只报**房间号**和
+        /// **要不要密码**，绝不回密码本身。
+        ///
+        /// 带 <c>?room=</c> 时是给 <c>/join</c> 页做校验的：告诉它"这个号在不在、
+        /// 密码对不对"，好让页面分别提示**房间不存在** / **密码错误**。
+        /// </summary>
+        private string RoomPayload(RequestContext ctx)
+        {
+            var asked = ctx.Request.GetQuery("room");
+            if (string.IsNullOrEmpty(asked))
+            {
+                return MiniJson.WriteObject(
+                    "room", _settings.RoomNumber,
+                    "needPassword", _settings.RoomHasPassword);
+            }
+
+            var exists = string.Equals(asked.Trim(), _settings.RoomNumber, StringComparison.Ordinal);
+            var passwd = ctx.Request.GetQuery("passwd") ?? string.Empty;
+
+            return MiniJson.WriteObject(
+                "room", _settings.RoomNumber,
+                "needPassword", _settings.RoomHasPassword,
+                "exists", exists,
+                // 房间都不在时没必要谈密码；房间没设密码时任何密码都算对（CheckRoomPassword 如此）。
+                "passwordOk", exists && _settings.CheckRoomPassword(passwd));
         }
 
         private string BuildQr(string playerUrl)
@@ -577,6 +671,7 @@ namespace TrpgMaps
             var targetIp = MiniJson.GetString(body, "ip");
             if (string.IsNullOrEmpty(targetIp)) targetIp = _settings.ListenIp;
             var targetPort = MiniJson.GetInt(body, "port", _settings.Port);
+            var previousPort = _settings.Port;
 
             var changed = !string.Equals(targetIp, _settings.ListenIp, StringComparison.OrdinalIgnoreCase)
                           || targetPort != _settings.Port;
@@ -616,7 +711,14 @@ namespace TrpgMaps
                     }
                     catch (Exception ex)
                     {
-                        AppLog.Write("按新 IP/端口重开服务失败", ex);
+                        string reason;
+                        if (!PortPicker.IsPortBlocked(ex, out reason)) reason = ex.Message;
+                        AppLog.Write("按新 IP/端口重开服务失败（" + reason + "）", ex);
+
+                        // 起不来就把服务拉回原端口：不然界面上写着新地址、真正在听的是旧的。
+                        _settings.SetPort(previousPort);
+                        try { if (_server != null) _server.Start(previousPort); }
+                        catch (Exception ex2) { AppLog.Write("退回原端口也失败", ex2); }
                     }
                 });
                 restarter.IsBackground = true;
@@ -705,9 +807,21 @@ namespace TrpgMaps
             }
             _settings.RoomLocked = locked;
 
-            _hub.Broadcast("room_state", MiniJson.WriteObject("locked", locked));
+            BroadcastRoomState();
             ctx.WriteText(200, MiniJson.WriteObject("success", true, "locked", locked));
             return false;
+        }
+
+        /// <summary>
+        /// 把房间状态（是否锁定 + 要不要密码）播给所有玩家页。
+        ///
+        /// 界面改密码时也走它（<c>POST /api/room/password</c> 与 MainForm 的"保存密码"
+        /// 必须是同一份广播），不然从界面改的密码要等玩家刷新页面才生效。
+        /// </summary>
+        public void BroadcastRoomState()
+        {
+            _hub.Broadcast("room_state", MiniJson.WriteObject(
+                "locked", _settings.RoomLocked, "needPassword", _settings.RoomHasPassword));
         }
 
         // ============================================================
@@ -767,18 +881,32 @@ namespace TrpgMaps
             var connectionId = MiniJson.GetString(body, "id") ?? string.Empty;
             var name = MiniJson.GetString(body, "name");
             var token = MiniJson.GetString(body, "token");
+            var room = MiniJson.GetString(body, "room");
+            var passwd = MiniJson.GetString(body, "passwd");
+
+            // ---- 房间号对不上：这个房间已经换号了（DM 重启就会换）----
+            // 玩家端收到 ROOM_GONE 会：向旧房间告辞（那次也会被判 ROOM_GONE）
+            // → 清掉 cookie 里的 token / 房间号 → 用**当前**房间号以新玩家重新加入。
+            if (!string.IsNullOrEmpty(room) && !string.Equals(room, _settings.RoomNumber, StringComparison.Ordinal))
+            {
+                WriteLoginFailure(ctx, connectionId, "房间已不在（房间号已更换）", RoomCodes.Gone);
+                return false;
+            }
+
+            // ---- 房间密码 ----
+            // 只拦"陌生人"：凭令牌认出来的老玩家直接放行（见 GameState.HasValidToken）。
+            // 否则老玩家每次刷新页面都要重打一遍密码，而二维码里本来就带着它。
+            if (!_game.HasValidToken(name, token) && !_settings.CheckRoomPassword(passwd))
+            {
+                WriteLoginFailure(ctx, connectionId, "房间密码不正确", RoomCodes.BadPassword);
+                return false;
+            }
 
             var result = _game.Login(connectionId, name, token, ctx.Request.RemoteIp);
 
             if (!result.Success)
             {
-                if (connectionId.Length > 0)
-                {
-                    _hub.SendTo(connectionId, "login_failed",
-                        MiniJson.WriteObject("msg", result.Message, "code", result.Code));
-                }
-                ctx.WriteText(200, MiniJson.WriteObject(
-                    "ok", false, "msg", result.Message, "code", result.Code));
+                WriteLoginFailure(ctx, connectionId, result.Message, result.Code);
                 return false;
             }
 
@@ -796,6 +924,7 @@ namespace TrpgMaps
                     "msg", result.Message,
                     "name", result.Name,
                     "token", result.Token,
+                    "room", _settings.RoomNumber,
                     "isNewToken", result.IsNewToken,
                     "roomLocked", _settings.RoomLocked));
             }
@@ -805,10 +934,94 @@ namespace TrpgMaps
                 "msg", result.Message,
                 "name", result.Name,
                 "token", result.Token,
+                "room", _settings.RoomNumber,
                 "isNewToken", result.IsNewToken));
             return false;
         }
 
+        /// <summary>登录失败：先给这条连接推一条 login_failed（页面在等它），再回响应。</summary>
+        private void WriteLoginFailure(RequestContext ctx, string connectionId, string message, string code)
+        {
+            if (!string.IsNullOrEmpty(connectionId))
+            {
+                _hub.SendTo(connectionId, "login_failed",
+                    MiniJson.WriteObject("msg", message, "code", code));
+            }
+            ctx.WriteText(200, MiniJson.WriteObject("ok", false, "msg", message, "code", code));
+        }
+
+        /// <summary>
+        /// **退出房间**（玩家页那个「退出房间」按钮）。
+        ///
+        /// 三种结果玩家端都当成"已退出"（反正本地要清 cookie），区别只在提示语：
+        ///   success=true                  → 服务器确认把人从名册里删了；
+        ///   code=ROOM_GONE                → 这个房间号已经不在线了（DM 重启换了号）；
+        ///   code=NOT_FOUND/TOKEN_MISMATCH → 本来就不在名册里 / 令牌对不上。
+        /// 通信本身失败（房间离线、连不上）由玩家端在 catch 里一律当成"已退出"。
+        /// </summary>
+        private bool HandleLeave(RequestContext ctx)
+        {
+            var body = ctx.Request.BodyJson();
+            var room = MiniJson.GetString(body, "room");
+            var name = MiniJson.GetString(body, "name");
+            var token = MiniJson.GetString(body, "token");
+
+            if (!string.IsNullOrEmpty(room) && !string.Equals(room, _settings.RoomNumber, StringComparison.Ordinal))
+            {
+                ctx.WriteText(200, MiniJson.WriteObject(
+                    "success", false, "code", RoomCodes.Gone, "message", "房间已不在"));
+                return false;
+            }
+
+            var result = _game.Leave(name, token);
+            if (!result.Success)
+            {
+                ctx.WriteText(200, MiniJson.WriteObject(
+                    "success", false, "code", result.Code, "message", result.Message));
+                return false;
+            }
+
+            // 名册变了：DM 的玩家列表要跟着刷；其他玩家的页面要弹"xxx 离开了房间"；
+            // DM 界面上那条胶囊提示走注入的回调（它不在 SSE 的订阅者里）。
+            _hub.Broadcast("player_list", PlayersJson());
+            _hub.Broadcast("player_left", MiniJson.WriteObject("name", result.Name));
+            NotifyPlayerLeft(result.Name);
+            AppLog.Write("玩家退出房间：" + result.Name + "（房间 " + _settings.RoomNumber + "）");
+
+            ctx.WriteText(200, MiniJson.WriteObject(
+                "success", true, "name", result.Name, "message", result.Message));
+            return false;
+        }
+
+        /// <summary>
+        /// 设置 / 清除房间密码（仅本机 DM）。空字符串 = 不需要密码。
+        ///
+        /// 只管"以后谁能进来"，不踢已经在房里的人 —— 密码是门锁，不是清场。
+        /// 改完地址和二维码都会跟着变（<see cref="ServerSettings.PlayerUrl"/> 里带着密码），
+        /// 界面那边会重新生成。
+        /// </summary>
+        private bool HandleRoomPassword(RequestContext ctx)
+        {
+            if (!ctx.IsLocal) return Forbidden(ctx);
+
+            var body = ctx.Request.BodyJson();
+            var effective = _settings.SetRoomPassword(MiniJson.GetString(body, "password"));
+            var needPassword = effective.Length > 0;
+
+            AppLog.Write(needPassword
+                ? "房间密码已设置（" + effective.Length + " 个字符）"
+                : "房间密码已清除（任何人都能加入）");
+
+            _hub.Broadcast("room_state", MiniJson.WriteObject(
+                "locked", _settings.RoomLocked, "needPassword", needPassword));
+
+            ctx.WriteText(200, MiniJson.WriteObject(
+                "success", true,
+                "needPassword", needPassword,
+                "playerUrl", _settings.PlayerUrl,
+                "message", needPassword ? "房间密码已设置" : "已清除房间密码（任何人都能加入）"));
+            return false;
+        }
         private bool HandleRequestMap(RequestContext ctx)
         {
             var body = ctx.Request.BodyJson();
@@ -846,12 +1059,12 @@ namespace TrpgMaps
             // 一次取一份快照，四个数一定自洽；取不到就发 0，
             // 玩家端见 0 会退回"贴左上角的等距网格"（老行为），而不是画出一个畸形的锚点。
             //
-            // 没有底图时**直接发 0**，不去看画布：画布这时算出来的"锚点"是
-            // "底图铺满整个视口"（ComputeImageRect 在没有图时的兜底），
-            // 那是描述"没有底图"的一种写法，不是真能用来对齐的几何。
-            // 明写成 0，载荷就自洽了 —— 不需要等防抖重播来纠正，
-            // 撤掉底图那一刻播出去的第一条就是对的。
-            var anchor = string.IsNullOrEmpty(name) ? null : CurrentAnchor();
+            // ⚠️ **没有底图时也要发**：这时画布算出来的锚点描述的是"整块画布"
+            // （ComputeImageRect 在没有图时的兜底就是铺满视口），而那正是手机该照着
+            // 画的那套网格 —— 电脑端没底图时也是整块画布铺网格。
+            // 以前这里发 0，手机只能退回"贴左上角、一格 37.8px"的老网格：在平板上
+            // 密得像一层细碎的小格，疏密也和电脑对不上（玩家端反馈的问题）。
+            var anchor = CurrentAnchor();
             var cellsX = anchor != null && anchor.Valid ? anchor.CellsX : 0.0;
             var cellsY = anchor != null && anchor.Valid ? anchor.CellsY : 0.0;
             var halfW = anchor != null && anchor.Valid ? anchor.HalfCellsW : 0.0;
@@ -916,6 +1129,19 @@ namespace TrpgMaps
             // 这些接口都只允许本机调用，玩家端永远碰不到。
             ctx.WriteText(403, MiniJson.WriteObject("success", false, "message", "仅本机可操作"));
             return false;
+        }
+
+        /// <summary>
+        /// 严格版"是不是本机"：只认回环地址。
+        ///
+        /// 给**带密码的接口**用（<c>/api/network</c>）。不像 <see cref="RequestContext.IsLocal"/>，
+        /// 它不接受"地址读不到"（unknown / 0.0.0.0）—— 那种情况按"不确定"处理，
+        /// 宁可让本机多试一次，也不能把房间密码漏给局域网。
+        /// </summary>
+        private static bool IsLoopback(RequestContext ctx)
+        {
+            var ip = ctx.Request.RemoteIp;
+            return ip == "127.0.0.1" || ip == "::1";
         }
 
         private static string GetMultipartBoundary(string contentType)

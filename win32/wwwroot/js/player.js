@@ -1,6 +1,14 @@
 /*
  * 玩家视图逻辑。
  *
+ * 房间：地址形态是 http://ip:port/<房间号>/player[?passwd=密码]
+ *  1) 开局先问一次 /api/room：现在这个房间是几号、要不要密码；
+ *  2) 地址栏里的房间号 / cookie 里存的房间号，只要有一个和它对不上，
+ *     就先拿旧 token 向**旧房间**发一次退出（旧房间一般已经不在了，那也算退出），
+ *     然后清掉 cookie 里的 token + 房间号，以**新玩家**重新加入；
+ *  3) 房间要密码时：地址里带对了（扫码进来的就是这种）→ 登录面板只问玩家名；
+ *     没带或不对 → 面板上多出一个「房间密码」输入框。
+ *
  * 令牌流程：
  *  1) 第一次用某个名称进入时，不带 token；服务器颁发随机 token 并写入 cookie；
  *  2) 之后（刷新/掉线重连）带着 cookie 里的 name + token 再进来，服务器校验通过才放行；
@@ -8,9 +16,25 @@
  *
  * 房间锁定：
  *  服务器锁定房间后，只有名册里已有名称 + 正确 token 的老玩家能重连，新名称会被拒绝。
+ *
+ * 退出房间：右下角那个圆形悬浮按钮 → 「退出房间」。
+ *  服务器确认收到 → 把这个人从名册里删掉（令牌一起作废）、并让所有人看到
+ *  "xxx 离开了房间"；连不上服务器（房间已经离线）→ 本地照样算退出，清掉 cookie。
  */
 (function () {
     'use strict';
+
+    /**
+     * 玩家页脚本的修订号。
+     *
+     * ⚠️ **改这个文件就顺手把它改掉。** 平板上加 `?debug=1` 时左下角第一行会打出来，
+     * 一眼就能确认"平板跑的到底是哪一版"。浏览器缓存 + 旧 exe 里的旧 wwwroot
+     * 已经骗过我们好几次了（改了 js、平板上看着却纹丝不动）。
+     */
+    const PLAYER_JS_REV = 'r27-2026-10-14-join页与默认端口';
+    // 顺手挂到 window 上：目视夹具（scripts\player_orientation_fixture.html）会读它，
+    // 用来确认"页面上跑的到底是哪一版"。不参与任何逻辑。
+    window.__playerJsRev = PLAYER_JS_REV;
 
     const socket = window.io();
 
@@ -27,10 +51,32 @@
     const canvas = document.getElementById('player-grid-canvas');
     const drawCanvas = document.getElementById('player-draw-canvas');
     const lockNotice = document.getElementById('room-lock-notice');
+    const roomInfo = document.getElementById('room-info');
+    const passInput = document.getElementById('room-pass-input');
+    const fab = document.getElementById('player-fab');
+    const fabMenu = document.getElementById('player-fab-menu');
+    const exitBtn = document.getElementById('exit-room-btn');
+    const toastEl = document.getElementById('player-toast');
+    const roomNumInput = document.getElementById('room-number-input');
+
+    /**
+     * 这一页是不是 `/join`（手填房间号的那种）。
+     *
+     * 页面本身和玩家页是**同一份** player.html / player.js —— `/join` 是"扫码之外的入口"，
+     * 给玩家在电脑上打开、或者二维码坏了时用。它比玩家页**多**一个房间号输入框，
+     * 密码框也一直亮着，所以是三个框：房间号 / 玩家名 / 密码。
+     * 三个都对上之后再走**和玩家页完全一样**的流程（见 submitJoin）。
+     */
+    const JOIN_MODE = /\/join\/?$/i.test(location.pathname);
 
     const COOKIE_NAME = 'dnd_player_name';
     const COOKIE_TOKEN = 'dnd_player_token';
+    const COOKIE_ROOM = 'dnd_player_room';
     const COOKIE_DAYS = 1;
+
+    // 密码本来就在地址的 query 里（扫码进来的那种）。页面内部跳转/重排会把它丢掉，
+    // 所以顺手存一份到 sessionStorage —— 只活到这个标签页关闭为止。
+    const PASSWD_KEY = 'dnd_room_passwd';
 
     // 状态条配色。"在线"用亮绿：这个指示就是给玩家"能不能收到更新"看的，
     // 以前那种柔和的 #6a6 在一眼扫过去时和灰色没差多少。
@@ -39,6 +85,26 @@
 
     let playerName = '';
     let loggedIn = false;
+    let loginBusy = false;
+
+    // ---------- 房间 ----------
+    // roomInUrl    : 地址栏路径里的房间号（玩家扫的那个码里带的）
+    // serverRoom   : 服务器**当前**的房间号（每次启动都换一个新的）
+    // needPassword : 服务器说这个房间要密码
+    // roomPassword : 手上有的密码（来自 ?passwd= 或玩家手输）
+    let roomInUrl = '';
+    let serverRoom = '';
+    let needPassword = false;
+    let roomPassword = '';
+    let passwordRejected = false;   // 上一次登录被服务器判"密码不对"
+    let roomReady = false;          // /api/room 问完了没有
+    let roomRetried = false;        // ROOM_GONE 之后只自动重来一次，免得死循环
+    let exited = false;             // 已经退出房间（再点"进入"应该是刷新页面重新加入）
+
+    // `?debug=1` 那个读数面板的刷新函数（setupOrientationDebug 填进来）。
+    // 房间信息是异步拿到的，拿到之后要立刻让它刷一次 —— 否则面板上会先
+    // 挂着"服务器 (未取到)"，真机取证时看着像出了问题。
+    let refreshDebugPanel = null;
 
     // 拖动/缩放状态
     let scale = 1;
@@ -92,9 +158,174 @@
         document.cookie = name + '=' + encodeURIComponent(value) + '; expires=' + expires + '; path=/';
     }
 
+    /**
+     * POST 一个 JSON 并等回包，可选超时。
+     *
+     * 超时用 `Promise.race` 而不是 `AbortController`：老一点的 iPad Safari 上
+     * 前者一定有。**退出房间**那一步尤其需要它 —— 房间已经离线时 fetch 会一直挂着，
+     * 玩家点了"退出"却半天没反应，比直接算他退出更糟。
+     */
+    function postWithTimeout(url, body, timeoutMs) {
+        const request = fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body || {}),
+            cache: 'no-store',
+        }).then((res) => res.json().catch(() => ({})));
+
+        if (!timeoutMs) return request;
+
+        return Promise.race([
+            request,
+            new Promise((_, reject) => {
+                setTimeout(() => reject(new Error('timeout')), timeoutMs);
+            }),
+        ]);
+    }
+
     function clearIdentity() {
         document.cookie = COOKIE_NAME + '=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/';
         document.cookie = COOKIE_TOKEN + '=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/';
+        document.cookie = COOKIE_ROOM + '=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/';
+    }
+
+    /**
+     * 只清 token 与房间号，**留着玩家名**。
+     *
+     * 房间换号 / 主动退出之后多半还是同一个人接着玩，名字留着能少打一次。
+     * （规定要求清掉的就是 token 和房间号这两样。）
+     */
+    function clearRoomIdentity() {
+        document.cookie = COOKIE_TOKEN + '=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/';
+        document.cookie = COOKIE_ROOM + '=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/';
+    }
+
+    // ---------- 房间号 / 房间密码 ----------
+
+    /** 从地址路径里读房间号：`/<数字>/player`。老地址（`/player`）读不到，给空串。 */
+    function readRoomFromPath() {
+        const m = /\/(\d{6,12})\/player\/?$/i.exec(location.pathname);
+        return m ? m[1] : '';
+    }
+
+    /** `?passwd=` 里的密码（扫码进来时带的那个）。 */
+    function readPasswdFromQuery() {
+        const m = /[?&]passwd=([^&]*)/.exec(location.search);
+        if (!m) return '';
+        try {
+            return decodeURIComponent(m[1].replace(/\+/g, ' '));
+        } catch (e) {
+            return m[1];
+        }
+    }
+
+    /**
+     * 密码的来源：地址里的 query 优先，其次本标签页之前存下的那份。
+     *
+     * ⚠️ 页面里有些跳转（比如服务器换地址之后的整页刷新）会把 query 丢掉，
+     * 所以不能只在开局读一次地址。
+     */
+    function loadStoredPasswd() {
+        const fromQuery = readPasswdFromQuery();
+        if (fromQuery) {
+            roomPassword = fromQuery;
+            try { sessionStorage.setItem(PASSWD_KEY, fromQuery); } catch (e) { /* 隐私模式 */ }
+            return;
+        }
+        try { roomPassword = sessionStorage.getItem(PASSWD_KEY) || ''; } catch (e) { roomPassword = ''; }
+    }
+
+    /** 密码框：`/join` 页一直亮着；玩家页只在"房间要密码 + 手上那份肯定不对"时出现。 */
+    function updatePasswordField() {
+        const show = JOIN_MODE || (needPassword && (!roomPassword || passwordRejected));
+        passInput.style.display = show ? 'block' : 'none';
+    }
+
+    function showRoomInfo(text, warn) {
+        if (!roomInfo) return;
+        roomInfo.textContent = text || '';
+        roomInfo.style.display = text ? 'block' : 'none';
+        roomInfo.className = warn ? 'warn' : '';
+    }
+
+    /**
+     * 开局跟服务器对一次房间：
+     *   ① 问 <c>/api/room</c>：现在这个房间是几号、要不要密码；
+     *   ② 地址栏里的号对不上 → 地址过期了，悄悄改成当前号（页面不用重载）；
+     *   ③ cookie 里的号对不上 → 身上那份身份属于**另一个房间**：
+     *      先拿旧 token 向旧房间告辞，再清掉 token + 房间号，以新玩家重新加入。
+     */
+    function initRoom() {
+        roomInUrl = readRoomFromPath();
+        loadStoredPasswd();
+
+        return fetch('/api/room', { cache: 'no-store' })
+            .then((res) => res.json())
+            .then((data) => {
+                serverRoom = String((data && data.room) || '');
+                needPassword = !!(data && data.needPassword);
+                updatePasswordField();
+
+                // `/join` 页没有房间号可对（号码是玩家马上要手填的），所以这里**不**改地址、
+                // 也**不**急着向旧房间告辞 —— 万一他只是打开看一眼就走了呢。
+                // 告辞推迟到 submitJoin 真正要加入新房间的那一刻。
+                if (JOIN_MODE) {
+                    if (loginInfo && !loginInfo.textContent) {
+                        loginInfo.textContent = '请填写房间号' +
+                            (needPassword ? '与房间密码' : '') + '，以及你的玩家名称';
+                    }
+                    return null;
+                }
+
+                const cookieRoom = getCookie(COOKIE_ROOM) || '';
+
+                if (serverRoom && roomInUrl && roomInUrl !== serverRoom) {
+                    showRoomInfo('房间已更新（' + roomInUrl + ' → ' + serverRoom + '）', true);
+                    roomInUrl = serverRoom;
+                    try {
+                        history.replaceState(null, '',
+                            '/' + serverRoom + '/player' + location.search + location.hash);
+                    } catch (e) { /* 有些环境不让改写地址，不影响进入 */ }
+                }
+
+                if (serverRoom && cookieRoom && cookieRoom !== serverRoom) {
+                    return leaveOldRoom(cookieRoom, serverRoom);
+                }
+                if (serverRoom && !needPassword) {
+                    showRoomInfo('房间号 ' + serverRoom, false);
+                }
+                return null;
+            })
+            .catch(() => null)   // 拿不到房间信息就按"不知道"继续（老服务端也不会回这个接口）
+            .then(() => {
+                roomReady = true;
+                if (refreshDebugPanel) refreshDebugPanel();   // 让 `?debug=1` 那行立刻显示真实房间
+            });
+    }
+
+    /**
+     * 向**旧房间**告辞（尽力而为）。
+     *
+     * 旧房间多半已经不在了（DM 重启就换号），这次请求会拿到 ROOM_GONE，
+     * 或者干脆连不上（连服务器都换地址了）。两种都算"已经退出" ——
+     * 我们只是尽到告知义务，然后把本地身份清干净、以新玩家重新加入。
+     */
+    function leaveOldRoom(oldRoom, newRoom) {
+        const name = getCookie(COOKIE_NAME) || '';
+        const token = getCookie(COOKIE_TOKEN) || '';
+
+        if (!name) {
+            clearRoomIdentity();
+            return null;
+        }
+
+        showRoomInfo('房间已更换，正在退出旧房间…', true);
+        return postWithTimeout('/api/leave', { room: oldRoom, name: name, token: token }, 4000)
+            .catch(() => null)
+            .then(() => {
+                clearRoomIdentity();
+                showRoomInfo('已退出旧房间 ' + oldRoom + '，正在加入房间 ' + newRoom, false);
+            });
     }
 
     // ---------- 登录 ----------
@@ -103,7 +334,14 @@
         const savedName = getCookie(COOKIE_NAME);
         const savedToken = getCookie(COOKIE_TOKEN);
         const token = (savedName && savedToken && savedName === name) ? savedToken : '';
-        socket.emit('player_login', { name: name, token: token });
+        loginBusy = true;
+        socket.emit('player_login', {
+            name: name,
+            token: token,
+            // 房间号：优先用服务器刚告诉我们的那个（地址栏里的可能已经过期）
+            room: serverRoom || roomInUrl,
+            passwd: roomPassword || '',
+        });
     }
 
     function setBusy(busy, text) {
@@ -111,18 +349,123 @@
         loginInfo.textContent = text || '';
     }
 
+    /**
+     * `/join` 页的"进入"：先让服务器**认房间号和密码**，认了再走和玩家页一样的登录。
+     *
+     * 两种错要分开报（"房间号不对"和"密码不对"是两回事），所以先问
+     * `/api/room?room=&passwd=` —— 它只回答"在不在、对不对"，**不回密码本身**。
+     */
+    function submitJoin(name) {
+        const room = (roomNumInput ? roomNumInput.value : '').trim();
+        if (!/^\d{6,12}$/.test(room)) {
+            loginError.textContent = '房间号是 8 位数字';
+            try { roomNumInput.focus(); } catch (e) { /* 忽略 */ }
+            return;
+        }
+
+        const typedPasswd = (passInput.value || '').trim();
+        const passwd = typedPasswd || roomPassword || '';
+        let accepted = false;
+
+        loginError.textContent = '';
+        setBusy(true, '正在查找房间...');
+
+        fetch('/api/room?room=' + encodeURIComponent(room) + '&passwd=' + encodeURIComponent(passwd),
+              { cache: 'no-store' })
+            .then((res) => res.json())
+            .then((data) => {
+                if (!data || data.exists !== true) {
+                    setBusy(false, '');
+                    loginError.textContent = '房间不存在';
+                    showRoomInfo('请核对 DM 屏幕上显示的 8 位房间号', true);
+                    return null;
+                }
+                if (data.passwordOk !== true) {
+                    setBusy(false, '');
+                    loginError.textContent = '房间密码错误';
+                    showRoomInfo('房间 ' + room + ' 需要正确的密码', true);
+                    try { passInput.focus(); } catch (e) { /* 忽略 */ }
+                    return null;
+                }
+
+                // 房间认了：把这一套记成"本页当前的房间"，之后的登录 / 退出 / 重连
+                // 与扫码进来的玩家**完全一样**。
+                accepted = true;
+                serverRoom = String(data.room || room);
+                roomInUrl = serverRoom;
+                needPassword = !!data.needPassword;
+                roomPassword = passwd;
+                if (typedPasswd) {
+                    try { sessionStorage.setItem(PASSWD_KEY, passwd); } catch (e) { /* 忽略 */ }
+                }
+                updatePasswordField();
+                showRoomInfo('房间号 ' + serverRoom, false);
+                roomReady = true;
+
+                // 身上那份身份属于别的房间 → 先向旧房间告辞（与玩家页同一套规矩）。
+                const cookieRoom = getCookie(COOKIE_ROOM) || '';
+                if (cookieRoom && cookieRoom !== serverRoom) {
+                    return leaveOldRoom(cookieRoom, serverRoom);
+                }
+                return null;
+            })
+            .then(() => {
+                if (!accepted || exited) return;
+                setBusy(true, '正在进入...');
+                attemptLogin(name);
+            })
+            .catch(() => {
+                setBusy(false, '');
+                loginError.textContent = '连不上服务器，请检查网络';
+            });
+    }
+
     loginBtn.addEventListener('click', () => {
+        // 已经退过房了：这条 SSE 连接已经关掉，得整页重来一次才能重新加入
+        if (exited) {
+            location.reload();
+            return;
+        }
+
         const name = nameInput.value.trim();
         if (!name) {
             loginError.textContent = '请输入名称';
             return;
         }
+
+        // `/join` 页：房间号是手填的，得先让服务器认这个房间和密码（见 submitJoin）。
+        if (JOIN_MODE) {
+            submitJoin(name);
+            return;
+        }
+
+        if (needPassword && passInput.style.display !== 'none' && !passInput.value.trim()) {
+            loginError.textContent = '请输入房间密码';
+            try { passInput.focus(); } catch (e) { /* 忽略 */ }
+            return;
+        }
+        // 玩家在密码框里打了字就以它为准（覆盖地址里带的那份）
+        if (passInput.style.display !== 'none' && passInput.value.trim()) {
+            roomPassword = passInput.value.trim();
+            try { sessionStorage.setItem(PASSWD_KEY, roomPassword); } catch (e) { /* 忽略 */ }
+        }
+
         loginError.textContent = '';
         setBusy(true, '正在连接...');
         attemptLogin(name);
     });
 
+    if (roomNumInput) {
+        roomNumInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') loginBtn.click();
+        });
+    }
+
     nameInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') loginBtn.click();
+    });
+
+    passInput.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') loginBtn.click();
     });
 
@@ -130,23 +473,66 @@
         // 服务器可能颁发新 token（首次加入），一定写回 cookie
         if (data && data.token) setCookie(COOKIE_TOKEN, data.token, COOKIE_DAYS);
         if (data && data.name) setCookie(COOKIE_NAME, data.name, COOKIE_DAYS);
+        // 房间号也存进 cookie：下次打开页面就能立刻看出"身上这份身份是不是
+        // 属于当前房间"，对不上就先向旧房间告辞（见 initRoom）。
+        if (data && data.room) setCookie(COOKIE_ROOM, data.room, COOKIE_DAYS);
+        else if (serverRoom) setCookie(COOKIE_ROOM, serverRoom, COOKIE_DAYS);
+
+        // `/join` 页进来的人：地址栏还是 `/join`，把它换成正经的 `/<房间号>/player`。
+        // 这样刷新、退出、被踢之后的流程与**扫码进来的玩家完全一致**；
+        // 密码跟着带上，刷新时连密码框都不用再填。
+        if (JOIN_MODE) {
+            const room = (data && data.room) || serverRoom;
+            if (room) {
+                try {
+                    history.replaceState(null, '', '/' + room + '/player' +
+                        (roomPassword ? '?passwd=' + encodeURIComponent(roomPassword) : ''));
+                } catch (e) { /* 有些环境不让改写地址，不影响进入 */ }
+            }
+        }
 
         playerName = (data && data.name) || nameInput.value.trim();
         displayName.textContent = playerName;
         loginOverlay.style.display = 'none';
         toolbar.style.display = 'flex';
+        setFabVisible(true);
         loginError.textContent = '';
         setBusy(false, '');
         loggedIn = true;
+        loginBusy = false;
+        passwordRejected = false;
         applyRoomLock(data ? data.roomLocked : false);
         socket.emit('request_map');
     });
 
     socket.on('login_failed', (data) => {
         const code = data && data.code;
+        loginBusy = false;
+
+        // 密码不对：把密码框亮出来（多半是地址里的密码过期了，或玩家手输了错）
+        if (code === 'BAD_PASSWORD') {
+            passwordRejected = true;
+            updatePasswordField();
+            setBusy(false, '');
+            loginError.textContent = (data && data.msg) || '房间密码不正确';
+            showRoomInfo('房间号 ' + (serverRoom || roomInUrl) + ' 需要密码', true);
+            try { passInput.focus(); } catch (e) { /* 忽略 */ }
+            return;
+        }
+
         loginError.textContent = (data && data.msg) || '登录失败';
         setBusy(false, '');
         applyRoomLock(code === 'ROOM_LOCKED');
+
+        // 房间号在"刚问完 /api/room"之后又变了（DM 恰好在这一瞬间重启）。
+        // 重问一次房间信息再试，只自动试一次。
+        if (code === 'ROOM_GONE' && !roomRetried) {
+            roomRetried = true;
+            clearRoomIdentity();
+            roomReady = false;
+            initRoom().then(() => { if (roomReady && !loggedIn && !exited) autoLogin(); });
+            return;
+        }
 
         // 名称被占用或令牌失效：清掉本地身份，避免一直重试同一个错误
         if (code === 'TOKEN_MISMATCH' || code === 'NAME_TAKEN' || code === 'COOKIE_CONFLICT') {
@@ -155,8 +541,17 @@
     });
 
     socket.on('room_state', (data) => {
-        applyRoomLock(data && data.locked);
+        applyRoomState(data || {});
     });
+
+    /** 房间状态的两种开关都要跟着走：锁定 + 要不要密码。 */
+    function applyRoomState(state) {
+        applyRoomLock(!!state.locked);
+        if (typeof state.needPassword === 'boolean') {
+            needPassword = state.needPassword;
+            updatePasswordField();
+        }
+    }
 
     function applyRoomLock(locked) {
         if (lockNotice) lockNotice.style.display = locked ? 'block' : 'none';
@@ -167,7 +562,12 @@
 
     // ---------- 自动重连 ----------
     function autoLogin() {
-        if (loggedIn) return;
+        if (loggedIn || exited || loginBusy) return;
+
+        // 房间信息还没拿到就先别登：地址栏里的房间号可能是过期的，
+        // 拿它去登录会被判 ROOM_GONE，白白多一次往返（initRoom 完了会再叫一次）。
+        if (!roomReady) return;
+
         const savedName = getCookie(COOKIE_NAME);
         const savedToken = getCookie(COOKIE_TOKEN);
 
@@ -224,29 +624,30 @@
             fetchDrawing();
         }
 
+        // 网格与底图的绑定：电脑端把"底图能放几格 / 画布半宽是几格"算好发下来，
+        // 这边照着重放（见 computeGridFrame）。**没有底图时这几个数照样发**
+        // —— 那时它们描述的是画布本身 —— 所以不再跟 data.url 绑在一起。
+        // 只有真正少了这几个数（老版本电脑端）才退回老网格。
+        if (typeof data.gridCellsX === 'number' && data.gridCellsX > 0 &&
+            typeof data.gridCellsY === 'number' && data.gridCellsY > 0 &&
+            typeof data.gridHalfW === 'number' && data.gridHalfW > 0 &&
+            typeof data.gridHalfH === 'number' && data.gridHalfH > 0) {
+            gridAnchor = {
+                cellsX: data.gridCellsX,
+                cellsY: data.gridCellsY,
+                halfW: data.gridHalfW,
+                halfH: data.gridHalfH,
+            };
+        } else {
+            gridAnchor = null;
+        }
+
         if (data.url) {
             mapImg.src = data.url;
-
-            // 网格与底图的绑定：电脑端把"底图能放几格 / 画布半宽是几格"算好发下来，
-            // 这边照着重放（见 computeGridFrame）。没有这几个数就退回老行为 ——
-            // 贴左上角的等距网格，位置当然对不上，但至少不会画出畸形的东西。
-            if (typeof data.gridCellsX === 'number' && data.gridCellsX > 0 &&
-                typeof data.gridCellsY === 'number' && data.gridCellsY > 0 &&
-                typeof data.gridHalfW === 'number' && data.gridHalfW > 0 &&
-                typeof data.gridHalfH === 'number' && data.gridHalfH > 0) {
-                gridAnchor = {
-                    cellsX: data.gridCellsX,
-                    cellsY: data.gridCellsY,
-                    halfW: data.gridHalfW,
-                    halfH: data.gridHalfH,
-                };
-            } else {
-                gridAnchor = null;
-            }
         } else {
-            // 电脑端清掉了底图：手机上也别继续挂着上一张
+            // 电脑端清掉了底图：手机上也别继续挂着上一张。
+            // 去掉 src 之后 naturalWidth 归零，computeGridFrame 于是按"画布"画网格。
             mapImg.removeAttribute('src');
-            gridAnchor = null;
         }
 
         applyRotation();
@@ -299,7 +700,18 @@
         const h = wrapper.offsetHeight;
         if (!w || !h) return null;
 
-        const fit = gridAnchor ? imageFitRect(w, h) : null;
+        // 有锚点时：底图在盒子里**实际占的矩形**。
+        // ⚠️ 没有底图（电脑端还没设图 / 刚把图撤掉）时锚点描述的是**画布本身**，
+        //    这时就把整个盒子当成那张"图" —— 电脑端没底图时也是整块画布铺网格，
+        //    这样两端的格子疏密才是同一个（以前这里直接退回下面那个贴左上角、
+        //    一格 37.8px 的等距网格，在平板上密得像一层细碎的小格）。
+        let fit = null;
+        if (gridAnchor) {
+            fit = (mapImg.naturalWidth > 0 && mapImg.naturalHeight > 0)
+                ? imageFitRect(w, h)
+                : { x: 0, y: 0, w: w, h: h };
+        }
+
         if (!fit) {
             const px = Math.max(5, 2.0 * (37.8 / 2));
             return {
@@ -309,17 +721,21 @@
             };
         }
 
-        const cellW = fit.w / gridAnchor.cellsX;
-        const cellH = fit.h / gridAnchor.cellsY;
+        // 一格多少像素。电脑端的格子**永远是正方形**（cm/格 × 37.8），所以这里
+        // 也只算一个 cell：拿"底图显示宽 ÷ cellsX"。
+        // 分成 fit.w/cellsX 与 fit.h/cellsY 两路，在"有底图"时结果一样
+        // （cellsX/cellsY 正好等于底图的比例），但在"没底图"时（那套锚点描述的是
+        // 画布，比例和盒子不一定相同）会算出长方形格子。
+        const cellPx = fit.w / gridAnchor.cellsX;
         return {
             anchored: true,
             cx: fit.x + fit.w / 2,     // 底图中心 = 锚点原点
             cy: fit.y + fit.h / 2,
             rotate: -mapRotation * Math.PI / 180,
-            cellW: cellW,
-            cellH: cellH,
-            ox: -gridAnchor.halfW * cellW,   // 电脑屏幕 (0,0) 在 F 里的位置
-            oy: -gridAnchor.halfH * cellH,
+            cellW: cellPx,
+            cellH: cellPx,
+            ox: -gridAnchor.halfW * cellPx,   // 电脑屏幕 (0,0) 在 F 里的位置
+            oy: -gridAnchor.halfH * cellPx,
             w: w,
             h: h,
             fit: fit,
@@ -473,19 +889,109 @@
 
 
     // ---------- 旋转 + 缩放 + 拖动 ----------
+    //
+    // ==========================================================================
+    // 【第二十三轮定稿】手机端额外旋转（extra）：**长边贴长边，只有两个值**
+    // ==========================================================================
+    //
+    //      视口竖（设备正立 / 倒立）        → extra = 90
+    //      视口横（向左横排 / 向右横排）    → extra = 0    ← 与电脑画布那一张完全一样
+    //
+    // 这是用户**逐姿态确认**过的唯一结论（原话）：
+    //   「倒立和向左横排（设备逆时针转 90 度）的地图朝向是对的，
+    //     正立和向右横排的方向是反的」
+    // 两组各错 180°，而它们恰好就是"竖屏组"和"横屏组" —— 于是规则只剩两个值。
+    //
+    // ---- 下面两条是被实机推翻的旧推导，留着是为了别再犯 ----
+    // · 第二十一轮："extra 恒 0"。那等于把画面**焊死在屏幕上**，屏幕在世界里跟着设备转，
+    //   于是地图也跟着转（用户：「地图会跟随设备一起旋转」）。
+    // · 第二十二轮："地图固定在世界里"，即 `extra = 设备转角 - 90`，想让四种姿态在
+    //   世界里朝同一边。实机证明这个前提**不成立**：用户看到的是"两种姿态对、
+    //   另两种反 180°"。⇒ **不要再假设"世界角恒定"，以实机结论为准。**
+    //
+    // 之所以能只看视口方向：手机上"竖视口 ⇔ 正立/倒立"、"横视口 ⇔ 左右横排"，
+    // 两者一一对应；而视口尺寸是**一定拿得到**的（设备转角 API 反倒可能没有）。
+    // 桌面浏览器视口是横的 → extra = 0，正好就是"当电脑看"。
+    //
+    // `?extra=<deg>` 是**叠加微调**（默认 0）：`?extra=180` 把这两个值整体翻面、
+    // `?extra=90` 再拧 90°，用来现场反悔，不用改代码不用重编。
+    const PORTRAIT_EXTRA = 90;
 
-    // 手机端在电脑的基础上**再**顺时针转 90°：
-    // 约定手机屏幕的"上端"对应电脑屏幕的"左端"、"下端"对应电脑屏幕的"右端"，
-    // 也就是网格的位置关系整体顺时针转 90°；底图则在这个基础上再多转 90°。
-    // 合起来：手机看到的画面 = 电脑看到的画面顺时针转 90°。
-    const PHONE_EXTRA_ROTATION = 90;
+    // 由 applyRotation() 按视口方向刷新。缓存成变量是为了让 toLocalDelta()
+    // （每次 touchmove 都会调）不必去读布局尺寸。
+    let extraRot = 0;
 
-    function totalRotation() {
-        return ((mapRotation + PHONE_EXTRA_ROTATION) % 360 + 360) % 360;
+    // 是否"填满屏幕"（`?box=fill`）。layoutBox() 会读它。
+    let boxFill = false;
+
+    function normDeg(v) {
+        return ((v % 360) + 360) % 360;
     }
 
+    /**
+     * 设备相对"正放"转了多少度（0/90/180/270）；两个 API 都拿不到就给 -1。
+     *
+     * ⚠️ 第二十三轮起它**不再参与决策**（只喂 `?debug=1` 读数），但符号仍然要对，
+     * 否则真机取证时会被读数带偏：
+     *   1) `window.orientation` 的正值是**逆时针** —— 所以"向右横排"（把设备
+     *      顺时针拧 90°）报的是 **-90**（MDN：positive values are counterclockwise）。
+     *   2) `screen.orientation.angle` 与它**相反**（兼容规范里 wo = -angle）。
+     *      直接把 angle 当 wo 用会把 90 与 270 对调，所以这里显式取反。
+     * 顺序也重要：**先问 `window.orientation`**（报的就是 wo 本身），
+     * 拿不到才退回 `screen.orientation.angle` 再取反。
+     */
+    function deviceRotationDeg() {
+        if (typeof window.orientation === 'number' && isFinite(window.orientation)) {
+            return normDeg(window.orientation);
+        }
+        const so = window.screen ? window.screen.orientation : null;
+        if (so && typeof so.angle === 'number' && isFinite(so.angle)) {
+            return (360 - normDeg(so.angle)) % 360;
+        }
+        return -1;
+    }
+
+    /**
+     * `?extra=<deg>` —— 在默认值上**叠加**一个角度（默认 0）。
+     *
+     * 平板上装不了开发者工具，靠它当场反悔：默认是"地图固定在世界里"，
+     * `?extra=180` 把脸翻过来、`?extra=90`/`270` 再拧 90°，不用改代码、不用重编。
+     */
+    function forcedExtraTrim() {
+        const m = /[?&]extra=(-?\d+)/.exec(location.search);
+        if (!m) return 0;
+        const v = parseInt(m[1], 10);
+        return isFinite(v) ? v : 0;
+    }
+
+    /** extra 是不是"转 90° 的那种"（90/270）—— 这时屏幕宽高在显示时是互换的。 */
     function isQuarterTurn(deg) {
-        return deg === 90 || deg === 270;
+        const d = normDeg(deg);
+        return d === 90 || d === 270;
+    }
+
+    /**
+     * `?box=fill` —— 让内容**填满屏幕**（会裁掉一部分底图），默认不填（整块画布都看得见、留黑边）。
+     *
+     * 这是个"取舍开关"，不是 bug 开关：屏幕比例和画布比例不同时，两者只能选一个 ——
+     *   · 默认（不填）：**看得见的格数与电脑完全一致**（和电脑同一块区域），代价是四周留黑边；
+     *   · `?box=fill`：铺满屏幕、没有黑边，代价是**一屏看到的格数比电脑少**（裁掉了边缘）。
+     */
+    function boxFillRequested() {
+        return /[?&]box=fill\b/.test(location.search);
+    }
+
+    function computeExtraRotation() {
+        const trim = forcedExtraTrim();
+        const view = viewportSize();
+        const landscapeView = view.w > view.h;
+        // 长边贴长边：视口竖 → 90、视口横 → 0。
+        // （桌面浏览器的视口是横的 → 0，正好就是"当电脑看、一点都不转"。）
+        return normDeg((landscapeView ? 0 : PORTRAIT_EXTRA) + trim);
+    }
+
+    function totalRotation() {
+        return ((mapRotation + extraRot) % 360 + 360) % 360;
     }
 
     // 视口尺寸。用容器而不是 100vh/100vw：移动端地址栏收起/展开时 100vh 会跳一下。
@@ -498,17 +1004,85 @@
     }
 
     /**
+     * 内容盒子的尺寸（**旋转前**那一对）。
+     *
+     * 【第二十一/二十二/二十三轮定稿】目标：**手机显示的就是电脑屏幕那一块画面**，
+     * 只是整体等比缩放、并按 extra 转了一下。
+     *
+     * ⚠️ 这里有两个"换向"最容易写错，必须分清：
+     *   ① **盒子的比例 = 电脑"逻辑视口"的比例**。
+     *      电脑端把底图转 90/270 时，它是把整块画布绕着中心转过去画的
+     *      （见 MapCanvas.ApplyRotationTransform），所以"逻辑视口"的宽高是**互换**的：
+     *      `逻辑宽 = 转90/270 ? 屏幕高 : 屏幕宽`。锚点里的 halfW/halfH 是**屏幕**视口的
+     *      （W/(2cell) / H/(2cell)），所以盒子要用 `转90/270 ? halfH*2 : halfW*2` 当宽。
+     *      ⇒ **以前这里一直用 halfW:halfH，底图只要转过 90/270，盒子比例就是错的**
+     *        （底图是按逻辑视口 cover/contain 进去的，盒子比例不对 ⇒ 底图与网格对不上、
+     *         看到的格数和位置全不对）。
+     *   ② **盒子在屏幕上转的是 `total = mapRotation + extra`**，所以"量视口"时
+     *      要在 `total` 是 90/270 时把视口宽高互换。
+     *      ⇒ 以前这里看的是 `extra`：底图转着的时候 total 会变成 180 或 0，
+     *        盒子就不该换向/该换向，于是**整块溢出屏幕被裁掉**（实测 667×400 塞进 400×800）。
+     *
+     * 拿不到锚点（老版本电脑端）时才退回"长边 × 短边"。
+     */
+    function layoutBox() {
+        const view = viewportSize();
+
+        if (gridAnchor && gridAnchor.halfW > 0 && gridAnchor.halfH > 0) {
+            // ① 盒子（逻辑视口）的宽高，单位 = 格
+            const mapQuarter = isQuarterTurn(mapRotation);
+            const cellsW = mapQuarter ? gridAnchor.halfH * 2 : gridAnchor.halfW * 2;
+            const cellsH = mapQuarter ? gridAnchor.halfW * 2 : gridAnchor.halfH * 2;
+
+            // ② 盒子要整体转 total 才贴到屏幕上 ⇒ 量的时候视口也跟着换向
+            const eff = isQuarterTurn(totalRotation())
+                ? { w: view.h, h: view.w }
+                : { w: view.w, h: view.h };
+
+            const k = boxFill
+                ? Math.max(eff.w / cellsW, eff.h / cellsH)     // 填满屏幕（会裁掉一部分）
+                : Math.min(eff.w / cellsW, eff.h / cellsH);    // 整块都看得见（留黑边）
+            if (k > 0 && isFinite(k)) {
+                const w = Math.max(1, Math.round(cellsW * k));
+                // 高度由宽度推出来，保证宽高比不被两次取整拧歪
+                return { w: w, h: Math.max(1, Math.round(w * cellsH / cellsW)) };
+            }
+        }
+
+        // 兜底：没有锚点 → 老电脑端 + 老网格，只能按屏幕来
+        const sc = window.screen;
+        let longSide = Math.max(view.w, view.h);
+        let shortSide = Math.min(view.w, view.h);
+        if (sc && sc.width > 0 && sc.height > 0) {
+            const scLong = Math.max(sc.width, sc.height);
+            const scShort = Math.min(sc.width, sc.height);
+            // 差太多说明是"窗口小于显示器"的桌面环境，用视口更贴近实际可见区域
+            if (longSide > 0 && scLong <= longSide * 1.25) {
+                longSide = scLong;
+                shortSide = scShort;
+            }
+        }
+        // 兜底那条本来就是"贴着屏幕来"的，转过去就得把长边/短边换回来
+        if (isQuarterTurn(totalRotation())) {
+            const t = longSide; longSide = shortSide; shortSide = t;
+        }
+        return { w: Math.max(1, Math.round(longSide)), h: Math.max(1, Math.round(shortSide)) };
+    }
+
+    /**
      * 摆好"内容盒子"并应用变换。
      *
-     * 盒子尺寸是**旋转前**的：转 90/270 时宽高互换，转过去之后才正好铺满屏幕。
-     * 如果一直用 100vw×100vh，转 90° 之后内容会比屏幕"高"，上下被切掉一截。
+     * 盒子按**旋转前**的尺寸给（转 90/270 时它的宽高正好是屏幕上看到的那一对的
+     * 互换），再整块 `rotate(total)` 转过去 —— 转完刚好铺满视口。
      */
     function applyRotation() {
-        const rot = totalRotation();
-        const view = viewportSize();
-        const quarter = isQuarterTurn(rot);
-        const boxW = quarter ? view.h : view.w;
-        const boxH = quarter ? view.w : view.h;
+        // 每一次重摆都重新问一遍（跟着设备转角走，见 computeExtraRotation()）
+        extraRot = computeExtraRotation();
+        boxFill = boxFillRequested();
+
+        const box = layoutBox();
+        const boxW = box.w;
+        const boxH = box.h;
 
         mapImg.style.width = boxW + 'px';
         mapImg.style.height = boxH + 'px';
@@ -626,13 +1200,342 @@
         updateTransform();
     });
 
-    window.addEventListener('orientationchange', () => {
+    /**
+     * 转屏之后重新摆一遍。
+     *
+     * 容器的布局尺寸不是立刻就变的（iOS 的地址栏、转屏动画期间都会晚一拍），
+     * 所以除了马上量一次，再补两个稍后的点 —— 少了这两拍，偶尔会按"转屏前的
+     * 尺寸"摆一次歪的，看起来就是"横过来了地图还是竖的"。
+     */
+    function onViewportChanged() {
         applyRotation();
-        // 旋屏后视口尺寸要等浏览器算完才准，稍后再量一次
-        setTimeout(applyRotation, 200);
+        resetFabPosition();     // 转屏后悬浮按钮归位到右下角（见 resetFabPosition）
+        setTimeout(applyRotation, 120);
+        setTimeout(applyRotation, 320);
+    }
+
+    window.addEventListener('orientationchange', onViewportChanged);
+    // resize 也要带上归位：iOS 转屏主要靠 resize 通知（orientationchange 有时根本不报），
+    // 而"转完自动回到右下角"是对这个按钮的硬要求。
+    window.addEventListener('resize', () => {
+        applyRotation();
+        resetFabPosition();
     });
 
-    window.addEventListener('resize', applyRotation);
+    // screen.orientation 是更靠谱的那条通知渠道（有些浏览器只在这里报变化）
+    const screenOrientation = window.screen ? window.screen.orientation : null;
+    if (screenOrientation && typeof screenOrientation.addEventListener === 'function') {
+        screenOrientation.addEventListener('change', onViewportChanged);
+    }
+
+    /**
+     * 现场排查用：地址后面加 `?debug=1`，左下角会挂一行朝向读数。
+     *
+     * 平板上装不了开发者工具，这一行字就是唯一的证据 —— 转一圈屏幕截个图，
+     * 就能看出这台机器到底报的是 portrait/landscape、有没有 secondary。
+     * `pointer-events:none`，不挡拖动。
+     */
+    function setupOrientationDebug() {
+        if (!/[?&]debug=1/.test(location.search)) return;
+
+        const box = document.createElement('div');
+        box.style.cssText = 'position:fixed;left:0;bottom:0;z-index:4000;pointer-events:none;' +
+            'background:rgba(0,0,0,.75);color:#5f5;font:12px/1.5 Consolas,monospace;' +
+            'padding:4px 6px;white-space:pre';
+        document.body.appendChild(box);
+
+        const tick = () => {
+            const view = viewportSize();
+            const layout = layoutBox();
+            const type = screenOrientation && screenOrientation.type ? screenOrientation.type : '(无)';
+            const angle = screenOrientation && typeof screenOrientation.angle === 'number'
+                ? screenOrientation.angle : '(无)';
+            const legacy = typeof window.orientation === 'number' ? window.orientation : '(无)';
+            const deg = deviceRotationDeg();
+            const trim = forcedExtraTrim();
+            const pose = deg < 0 ? '(读不到)'
+                : (deg === 180 ? '倒立'
+                    : deg === 90 ? '向左横排'
+                        : deg === 270 ? '向右横排' : '正立');
+            const mapQ = isQuarterTurn(mapRotation);
+            const anchorLine = gridAnchor
+                ? '锚点 逻辑视口 ' +
+                  (mapQ ? gridAnchor.halfH * 2 : gridAnchor.halfW * 2).toFixed(2) + 'x' +
+                  (mapQ ? gridAnchor.halfW * 2 : gridAnchor.halfH * 2).toFixed(2) + ' 格' +
+                  (mapQ ? '（底图转 90/270 ⇒ 与屏幕换向）' : '') + '\n' +
+                  '     halfW ' + gridAnchor.halfW.toFixed(3) + ' halfH ' + gridAnchor.halfH.toFixed(3) +
+                  ' cellsX ' + gridAnchor.cellsX.toFixed(3) + ' cellsY ' + gridAnchor.cellsY.toFixed(3) + '\n'
+                : '锚点 (无·退回老网格，格数与电脑无对应关系)\n';
+            const gf = gridFrame;
+            const gridLine = gf && gf.anchored
+                ? '网格 cellPx ' + gf.cellW.toFixed(2) +
+                  '  底图矩形 ' + gf.fit.x.toFixed(1) + ',' + gf.fit.y.toFixed(1) + ' ' +
+                  gf.fit.w.toFixed(1) + 'x' + gf.fit.h.toFixed(1) + '\n'
+                : '网格 (老网格·贴左上角)\n';
+            const landscapeView = view.w > view.h;
+            box.textContent =
+                'player.js ' + PLAYER_JS_REV + '\n' +
+                // 房间这几行是给"平板/手机上房间号或密码不对"这类问题取证用的：
+                // 一眼能看出地址里的号、服务器当前的号、以及密码要不要、判没判错。
+                '房间 URL ' + (JOIN_MODE ? '/join(手填)' : (roomInUrl || '(老地址)')) +
+                '  服务器 ' + (serverRoom || '(未取到)') +
+                '  密码 ' + (needPassword ? (passwordRejected ? '需要·已判错' : '需要') : '不需要') +
+                (roomPassword ? '  已带密码' : '  未带密码') + '\n' +
+                'viewport ' + view.w + 'x' + view.h + (landscapeView ? ' 横' : ' 竖') + '\n' +
+                '盒子(旋转前) ' + layout.w + 'x' + layout.h +
+                (boxFill ? '  [box=fill 铺满]' : '  [留边]') + '\n' +
+                anchorLine +
+                '底图 ' + (mapImg.naturalWidth || 0) + 'x' + (mapImg.naturalHeight || 0) +
+                '  ' + mapFitMode + '\n' +
+                gridLine +
+                'orientation.type  ' + type + '\n' +
+                'orientation.angle ' + angle + '\n' +
+                'window.orientation ' + legacy + '\n' +
+                '设备转角 ' + (deg < 0 ? '(无)' : deg + '°') + '  → ' + pose + '（仅供参考）\n' +
+                'extra ' + extraRot + '  ← 长边贴长边：视口' +
+                (landscapeView ? '横→0' : '竖→90') +
+                (trim !== 0 ? '  ?extra 微调 ' + trim : '') + '\n' +
+                'map ' + mapRotation + '  total ' + totalRotation();
+        };
+
+        tick();
+        refreshDebugPanel = tick;      // 房间信息到手后 initRoom 会叫它刷一次
+        window.addEventListener('resize', tick);
+        setInterval(tick, 500);
+    }
+
+    // ---------- 右下角悬浮按钮：菜单 / 退出房间 ----------
+    //
+    // 位置要求和地图**不一样**：地图那块是"长边贴长边"跟着转的，而这个按钮要的是
+    // **相对屏幕**永远待在右下角。所以它固定在 `fixed` 坐标系里（不在那个被 rotate 的
+    // wrapper 里），转屏之后浏览器自己会把 right/bottom 重算一遍；
+    // 玩家拖过之后由 JS 写下 left/top，转屏时清掉这两个内联样式就等于归位。
+
+    const FAB_MARGIN = 12;      // 面板至少离屏幕边缘这么远
+    const FAB_GAP = 8;          // 按钮与面板之间的缝
+    const FAB_DRAG_SLOP = 6;    // 移动不超过这么多像素就算"点击"而不是"拖动"
+
+    let fabDragging = false;
+    let fabMoved = false;
+    let fabGrabX = 0;
+    let fabGrabY = 0;
+    let fabStartX = 0;
+    let fabStartY = 0;
+
+    function setFabVisible(visible) {
+        fab.classList.toggle('fab-hidden', !visible);
+        if (!visible) closeFabMenu();
+    }
+
+    function menuOpen() {
+        return !fabMenu.classList.contains('fab-hidden');
+    }
+
+    function closeFabMenu() {
+        fabMenu.classList.add('fab-hidden');
+    }
+
+    /**
+     * 把展开的面板摆到"整个内容都看得见"的位置：
+     *   横向：先按"右边缘和按钮对齐"，再夹进屏幕；
+     *   纵向：按钮下面放得下就放下面，放不下就翻到按钮上方 —— 再夹一次。
+     * 夹完还放不下（屏幕太扁）就交给 CSS 的 `max-height + overflow-y:auto`，
+     * 面板自己滚，但**不显示滚动条**。
+     */
+    function placeFabMenu() {
+        const b = fab.getBoundingClientRect();
+        const w = fabMenu.offsetWidth;
+        const h = fabMenu.offsetHeight;
+
+        let left = b.right - w;
+        left = Math.min(Math.max(FAB_MARGIN, left), Math.max(FAB_MARGIN, window.innerWidth - w - FAB_MARGIN));
+
+        const below = window.innerHeight - b.bottom;
+        let top = (below >= h + FAB_GAP + FAB_MARGIN) ? (b.bottom + FAB_GAP) : (b.top - h - FAB_GAP);
+        top = Math.min(Math.max(FAB_MARGIN, top), Math.max(FAB_MARGIN, window.innerHeight - h - FAB_MARGIN));
+
+        fabMenu.style.left = Math.round(left) + 'px';
+        fabMenu.style.top = Math.round(top) + 'px';
+    }
+
+    function openFabMenu() {
+        fabMenu.classList.remove('fab-hidden');
+        // 先摆到边上再量尺寸，量到的是真实宽高，最后再摆一次到正确位置
+        fabMenu.style.left = FAB_MARGIN + 'px';
+        fabMenu.style.top = FAB_MARGIN + 'px';
+        placeFabMenu();
+    }
+
+    function toggleFabMenu() {
+        if (menuOpen()) closeFabMenu();
+        else openFabMenu();
+    }
+
+    /**
+     * 归位：清掉拖动留下的内联 left/top，回到 CSS 里那组 `right/bottom`。
+     * **每次转屏都会调一次** —— 这就是"旋转后自动回到右下角"。
+     */
+    function resetFabPosition() {
+        fab.style.left = '';
+        fab.style.top = '';
+        if (menuOpen()) placeFabMenu();
+    }
+
+    function moveFab(clientX, clientY) {
+        const size = fab.offsetWidth || 54;
+        let left = clientX - fabGrabX;
+        let top = clientY - fabGrabY;
+        left = Math.min(Math.max(0, left), Math.max(0, window.innerWidth - size));
+        top = Math.min(Math.max(0, top), Math.max(0, window.innerHeight - size));
+        fab.style.left = Math.round(left) + 'px';
+        fab.style.top = Math.round(top) + 'px';
+    }
+
+    function fabPointerDown(clientX, clientY) {
+        const b = fab.getBoundingClientRect();
+        fabGrabX = clientX - b.left;
+        fabGrabY = clientY - b.top;
+        fabStartX = clientX;
+        fabStartY = clientY;
+        fabDragging = true;
+        fabMoved = false;
+        if (menuOpen()) closeFabMenu();
+    }
+
+    function fabPointerMove(clientX, clientY) {
+        if (!fabDragging) return;
+        if (!fabMoved &&
+            Math.hypot(clientX - fabStartX, clientY - fabStartY) < FAB_DRAG_SLOP) return;
+        fabMoved = true;
+        moveFab(clientX, clientY);
+    }
+
+    function fabPointerUp() {
+        if (!fabDragging) return;
+        fabDragging = false;
+        if (!fabMoved) toggleFabMenu();     // 没挪动过 = 一次点击
+    }
+
+    fab.addEventListener('touchstart', (e) => {
+        if (e.touches.length !== 1) return;
+        e.preventDefault();
+        const t = e.touches[0];
+        fabPointerDown(t.clientX, t.clientY);
+    }, { passive: false });
+
+    fab.addEventListener('touchmove', (e) => {
+        if (!fabDragging || e.touches.length !== 1) return;
+        e.preventDefault();
+        const t = e.touches[0];
+        fabPointerMove(t.clientX, t.clientY);
+    }, { passive: false });
+
+    fab.addEventListener('touchend', (e) => {
+        if (e.touches.length === 0) fabPointerUp();
+    }, { passive: true });
+
+    fab.addEventListener('touchcancel', () => { fabDragging = false; }, { passive: true });
+
+    // 桌面上用鼠标也能拖（调试用；玩家页主要在手机 / 平板上）
+    fab.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        fabPointerDown(e.clientX, e.clientY);
+    });
+    window.addEventListener('mousemove', (e) => fabPointerMove(e.clientX, e.clientY));
+    window.addEventListener('mouseup', () => fabPointerUp());
+
+    // 点到别处就把面板收起来
+    document.addEventListener('touchstart', (e) => {
+        if (!menuOpen()) return;
+        if (fab.contains(e.target) || fabMenu.contains(e.target)) return;
+        closeFabMenu();
+    }, { passive: true });
+
+    exitBtn.addEventListener('click', () => { exitRoom(); });
+
+    /**
+     * 退出房间。
+     *
+     * 服务器那边：房间在 + token 对 → 把这个人从名册里删掉（令牌一起作废），
+     * 并且所有人（含 DM）都会看到 "xxx 离开了房间"。
+     *
+     * 本地这边：**不管服务器有没有回话，都算退出** —— 房间已经离线（DM 把程序关了）
+     * 的时候，"退出"本来就该以本地为准，否则玩家会被困在一个死掉的房间里。
+     */
+    function exitRoom() {
+        const name = playerName || getCookie(COOKIE_NAME) || '';
+        const token = getCookie(COOKIE_TOKEN) || '';
+        const room = serverRoom || roomInUrl || getCookie(COOKIE_ROOM) || '';
+
+        exitBtn.disabled = true;
+        exitBtn.textContent = '正在退出…';
+
+        postWithTimeout('/api/leave', { room: room, name: name, token: token }, 4000)
+            .then((res) => {
+                if (res && res.success) return finishExit('已退出房间');
+                if (res && res.code === 'ROOM_GONE') return finishExit('房间已不在，已在本地退出');
+                if (res && res.message) return finishExit(res.message + '（已在本地退出）');
+                return finishExit('已退出房间');
+            })
+            .catch(() => finishExit('房间已离线，已在本地退出'));
+    }
+
+    function finishExit(message) {
+        exitBtn.disabled = false;
+        exitBtn.textContent = '退出房间';
+        closeFabMenu();
+        setFabVisible(false);
+
+        // 清掉 token 与房间号（**名字留着**，重新加入时少打一次）
+        clearRoomIdentity();
+        try { sessionStorage.removeItem(PASSWD_KEY); } catch (e) { /* 忽略 */ }
+        roomPassword = '';
+        passwordRejected = false;
+        loggedIn = false;
+        exited = true;
+        playerName = '';
+        toolbar.style.display = 'none';
+        displayName.textContent = '未知';
+
+        try { socket.close(); } catch (e) { /* 已经关了 */ }
+
+        loginOverlay.style.display = 'flex';
+        loginError.textContent = '';
+        setBusy(false, '');
+        showRoomInfo('', false);
+        if (!nameInput.value.trim()) {
+            const savedName = getCookie(COOKIE_NAME);
+            if (savedName) nameInput.value = savedName;
+        }
+        loginInfo.textContent = message + '　点「进入」重新加入。';
+    }
+
+    // ---------- 顶部胶囊提示（"xxx 离开了房间"） ----------
+
+    let toastTimer = null;
+
+    /**
+     * 从屏幕上方正中滑下来一条胶囊提示，`ms` 毫秒后缩回。
+     */
+    function showToast(text, ms) {
+        if (!toastEl) return;
+        toastEl.textContent = text;
+        // 先摘掉再戴上，保证连点两次也能重新触发动画
+        toastEl.classList.remove('show');
+        void toastEl.offsetWidth;
+        toastEl.classList.add('show');
+
+        if (toastTimer) clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => {
+            toastTimer = null;
+            toastEl.classList.remove('show');
+        }, ms || 2000);
+    }
+
+    socket.on('player_left', (data) => {
+        const who = (data && data.name) ? data.name : '有玩家';
+        showToast(who + ' 离开了房间', 2000);
+    });
 
     // ---------- 连接状态 ----------
     socket.on('disconnect', () => {
@@ -678,6 +1581,21 @@
     });
 
     // 启动
+    // 先把地址里的房间号与密码读出来，**再**装调试面板：不然 `?debug=1` 的第一屏
+    // 会显示"房间 URL (老地址)"（那时还没读），看着像出了问题。
+    roomInUrl = readRoomFromPath();
+    loadStoredPasswd();
+
+    // `/join` 页多给一个房间号输入框（密码框由 updatePasswordField 一直亮着，所以是三个框）。
+    if (JOIN_MODE && roomNumInput) roomNumInput.style.display = 'block';
+
+    setupOrientationDebug();
     applyRotation();
-    if (socket.connected) autoLogin();
+
+    // 房间信息问清楚之后再谈登录：房间号是不是当前这个、要不要密码、
+    // 要不要先拿旧 token 向旧房间告辞（见 initRoom）。
+    // ⚠️ `/join` 页**不**自动登录 —— 房间号得玩家自己填。
+    initRoom().then(() => {
+        if (!JOIN_MODE && socket.connected) autoLogin();
+    });
 })();

@@ -8,7 +8,7 @@ $dst = $PSScriptRoot | Split-Path -Parent
 if (-not (Test-Path (Join-Path $dst 'TrpgMaps.csproj'))) { $dst = $PSScriptRoot }
 $out = Join-Path $dst 'bin\Release'
 $exe = Join-Path $out 'TrpgMaps.exe'
-$base = 'http://127.0.0.1:5000'
+$base = 'http://127.0.0.1:20020'
 
 if (-not (Test-Path $exe)) { Write-Host "exe not found: $exe"; exit 1 }
 
@@ -67,9 +67,18 @@ if (-not $ready) {
 
 Write-Host ""
 Write-Host "=== network info ==="
+# The room password lives in room.json and survives restarts, so a password
+# left over from an earlier run would change the player url (it would gain a
+# ?passwd= suffix) and make the assertion below flaky. Clear it first - that
+# also exercises /api/room/password, which is a v1.0.2 endpoint.
+Post-Json "$base/api/room/password" @{ password = '' } | Out-Null
 $net = (Invoke-WebRequest "$base/api/network" -UseBasicParsing).Content | ConvertFrom-Json
 Check 'local ip' ($net.ip -match '^\d+\.\d+\.\d+\.\d+$') "ip=$($net.ip) port=$($net.port)"
-Check 'player url' ($net.playerUrl -eq "http://$($net.ip):5000/player") $net.playerUrl
+# v1.0.2: the url carries the per-instance room number, so it is
+#   http://ip:port/<room>/player      (plus ?passwd= when a password is set)
+Check 'room number is 8 digits' ($net.room -match '^[1-9][0-9]{7}$') "room=$($net.room)"
+Check 'no room password after clearing it' ($net.roomHasPassword -eq $false)
+Check 'player url' ($net.playerUrl -eq "http://$($net.ip):$($net.port)/$($net.room)/player") $net.playerUrl
 Check 'qr code png' ($net.qrCode.StartsWith('data:image/png;base64,') -and $net.qrCode.Length -gt 500) "len=$($net.qrCode.Length)"
 
 Write-Host ""
@@ -552,11 +561,26 @@ $rmOut = Receive-Job $rmJob -Wait -AutoRemoveJob
 # The phone clears the image when url is empty and keeps drawing its grid.
 Check 'phone is told the basemap is gone' `
     ($rmOut -match '"image"\s*:\s*""' -and $rmOut -match '"url"\s*:\s*""') "empty image/url"
-# With no basemap there is nothing to align against, so the anchor must be zeros
-# rather than "the basemap fills the whole viewport".
-Check 'no basemap publishes a zero grid anchor' `
-    ($rmOut -match '"gridCellsX"\s*:\s*0' -and $rmOut -match '"gridHalfW"\s*:\s*0') `
-    "gridCellsX/gridHalfW are 0"
+# With no basemap the anchor must NOT be zeros: it describes the CANVAS itself,
+# so the phone keeps the same cell size as the DM canvas instead of falling back
+# to its own 37.8px grid (that fallback showed up as "tiny dense cells").
+#
+# NOTE: this used to assert *zeros* - the pre-round-20 rule - and had been
+# silently failing ever since the rule changed. It now pins "non-zero".
+#
+# Also note (measured, not guessed): the very first payload right after removing
+# the map still carries the PREVIOUS basemap's gridCellsX (the canvas has not
+# re-laid itself out yet), so cellsX != 2*halfW here. It self-heals within
+# ~600ms via the debounced anchor re-broadcast, so this test only requires the
+# anchor to be non-zero - asserting cellsX == 2*halfW at this instant would be
+# pinning a race, not a rule.
+$anchorHalf = [regex]::Match($rmOut, '"gridHalfW"\s*:\s*([0-9.]+)').Groups[1].Value
+$anchorCells = [regex]::Match($rmOut, '"gridCellsX"\s*:\s*([0-9.]+)').Groups[1].Value
+$halfW = if ($anchorHalf) { [double]$anchorHalf } else { 0 }
+$cellsX = if ($anchorCells) { [double]$anchorCells } else { 0 }
+Check 'no basemap: anchor is still published (not zeros)' `
+    ($halfW -gt 0 -and $cellsX -gt 0) `
+    "gridCellsX=$cellsX gridHalfW=$halfW"
 
 # Leave the app usable.
 $restore = (Post-Json "$base/api/maps/set" @{ image = $mapA; mode = 'contain' }).Content | ConvertFrom-Json

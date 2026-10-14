@@ -174,7 +174,7 @@ namespace TrpgMaps
     //  服务器设置
     // ============================================================
 
-    /// <summary>监听地址、端口、房间锁定状态。运行中可修改并重开服务。</summary>
+    /// <summary>监听地址、端口、房间号 / 房间密码、房间锁定状态。运行中可修改并重开服务。</summary>
     internal sealed class ServerSettings
     {
         /// <summary>命令行 --port 传入的端口覆盖（自动化测试用，避免撞上正在运行的实例）。</summary>
@@ -185,10 +185,55 @@ namespace TrpgMaps
         private int _port = AppEnv.DefaultPort;
         private bool _roomLocked;
 
+        /// <summary>
+        /// 房间号与房间密码（见 <see cref="RoomState"/>）。
+        /// 放在这里是因为"玩家地址"由它俩和 ip/port 一起决定，而地址在
+        /// 界面、接口、二维码、玩家端跳转里到处都在用 —— 只留一个出处。
+        /// </summary>
+        private readonly RoomState _room;
+
         public ServerSettings()
+            : this(RoomState.DefaultPath())
         {
+        }
+
+        /// <summary>
+        /// 指定房间配置文件的位置（自检用临时路径 —— 免得把真房间的号 / 密码覆盖掉）。
+        /// </summary>
+        public ServerSettings(string roomPath)
+        {
+            _room = new RoomState(roomPath);
             _listenIp = IpEnumerator.PickRecommended();
             if (IsValidPort(PortOverride)) _port = PortOverride;
+        }
+
+        /// <summary>当前房间（房间号 + 可选密码）。</summary>
+        public RoomState Room
+        {
+            get { return _room; }
+        }
+
+        /// <summary>当前房间号（8 位数字）。</summary>
+        public string RoomNumber
+        {
+            get { return _room.Number; }
+        }
+
+        public bool RoomHasPassword
+        {
+            get { return _room.HasPassword; }
+        }
+
+        /// <summary>设置 / 清除房间密码（空串 = 不需要密码）。</summary>
+        public string SetRoomPassword(string value)
+        {
+            return _room.SetPassword(value);
+        }
+
+        /// <summary>密码是否匹配（房间没设密码时恒为 true）。</summary>
+        public bool CheckRoomPassword(string candidate)
+        {
+            return _room.CheckPassword(candidate);
         }
 
         public string ListenIp
@@ -201,16 +246,33 @@ namespace TrpgMaps
             get { lock (_gate) { return _port; } }
         }
 
+        /// <summary>
+        /// 把"当前实际端口"改掉。
+        ///
+        /// ⚠️ 只给"服务已经起来了、端口已经确定"的场合用（默认端口绑不上时换的那个号，
+        /// 见 <see cref="PortPicker"/>）。用户改配置走 <see cref="TryUpdate"/>（它带地址校验）。
+        /// 改完 <see cref="PlayerUrl"/> 会自动跟着变 —— 界面、二维码、换址跳转都读它。
+        /// </summary>
+        public void SetPort(int port)
+        {
+            if (!IsValidPort(port)) return;
+            lock (_gate) { _port = port; }
+        }
+
         public bool RoomLocked
         {
             get { lock (_gate) { return _roomLocked; } }
             set { lock (_gate) { _roomLocked = value; } }
         }
 
-        /// <summary>玩家访问地址。</summary>
+        /// <summary>
+        /// 玩家访问地址：<c>http://ip:port/房间号/player</c>（设了密码再带 <c>?passwd=</c>）。
+        /// 房间号在**路径**里，密码在 **query** 里 —— 二维码扫出来就是这一条，
+        /// 玩家因此不用手打密码。
+        /// </summary>
         public string PlayerUrl
         {
-            get { return "http://" + ListenIp + ":" + Port + "/player"; }
+            get { return _room.BuildUrl(ListenIp, Port); }
         }
 
         public static bool IsValidPort(int port)

@@ -179,6 +179,12 @@ namespace TrpgMaps
             ok &= CheckDrawing(log, outDir);
             log.Add("");
 
+            // ---------------- 房间号 / 房间密码 / 退出房间 ----------------
+
+            log.Add("--- room: 8-digit number, password, leave ---");
+            ok &= CheckRoom(log, outDir);
+            log.Add("");
+
             // ---------------- 侧栏几何 ----------------
 
             log.Add("--- sidebar geometry (button inset / icon position) ---");
@@ -2217,6 +2223,132 @@ namespace TrpgMaps
                 log.Add("  " + c.Name + " : FAILED (" + ex.Message + ")");
                 return 0;
             }
+        }
+
+        /// <summary>
+        /// 房间号 / 房间密码 / 退出房间 —— 这三件事都能离屏测（不碰网络、不开窗口）。
+        ///
+        /// 房间号那条断言就是需求本身："每次打开程序都为这个实例分配一个**不与上一次
+        /// 冲突**的随机 8 位房间号"。这里在同一份配置文件上连着开 20 个 RoomState
+        /// （= 模拟启动 20 次），要求每个号都合法、而且都不同于上一次。
+        /// </summary>
+        private static bool CheckRoom(List<string> log, string outDir)
+        {
+            var path = Path.Combine(outDir, "selfcheck-room.json");
+            try { if (File.Exists(path)) File.Delete(path); }
+            catch (Exception ex) { AppLog.Write("自检：删不掉旧的房间文件：" + path, ex); }
+
+            var ok = true;
+
+            // ---- 每次启动换一个新号，且不与上一次重复 ----
+            string previous = null;
+            var numbersOk = true;
+            for (var i = 0; i < 20; i++)
+            {
+                var room = new RoomState(path);
+                var number = room.Number;
+                if (!RoomState.IsValidNumber(number)) numbersOk = false;
+                if (previous != null && string.Equals(number, previous, StringComparison.Ordinal)) numbersOk = false;
+                previous = number;
+            }
+            log.Add("  20 starts -> 8-digit number, always different from the previous one     " +
+                    (numbersOk ? "-> OK" : "-> FAIL"));
+            ok &= numbersOk;
+
+            // ---- 密码跨"重启"保留，房间号照样换新 ----
+            var withPassword = new RoomState(path);
+            withPassword.SetPassword("s3cret");
+            var afterRestart = new RoomState(path);
+
+            var passwordOk = afterRestart.HasPassword
+                          && afterRestart.CheckPassword("s3cret")
+                          && !afterRestart.CheckPassword("nope")
+                          && !afterRestart.CheckPassword(null)
+                          && !string.Equals(afterRestart.Number, withPassword.Number, StringComparison.Ordinal);
+            log.Add("  password survives a restart, room number does not                       " +
+                    (passwordOk ? "-> OK" : "-> FAIL"));
+            ok &= passwordOk;
+
+            // ---- 地址形态：房间号在路径里、密码在 query 里 ----
+            var url = afterRestart.BuildUrl("192.168.1.10", 20020);
+            var want = "http://192.168.1.10:20020/" + afterRestart.Number + "/player?passwd=s3cret";
+            log.Add("  player url: " + url);
+            var urlOk = string.Equals(url, want, StringComparison.Ordinal);
+            log.Add("  player url shape /<room>/player?passwd=<pw>                            " +
+                    (urlOk ? "-> OK" : "-> FAIL"));
+            ok &= urlOk;
+
+            afterRestart.SetPassword(string.Empty);
+            var plainUrl = afterRestart.BuildUrl("192.168.1.10", 20020);
+            var noPasswordOk = !afterRestart.HasPassword
+                            && afterRestart.CheckPassword("anything")
+                            && plainUrl.IndexOf("passwd", StringComparison.Ordinal) < 0
+                            && plainUrl.EndsWith("/player", StringComparison.Ordinal);
+            log.Add("  clearing the password drops ?passwd= from the url                      " +
+                    (noPasswordOk ? "-> OK" : "-> FAIL"));
+            ok &= noPasswordOk;
+
+            // ---- 默认端口 + 绑不上时的候选顺序 ----
+            // 默认端口刻意不是 5000（常常被系统预留）也不是 8080（未备案域名会被运营商阻断）。
+            var portOk = AppEnv.DefaultPort == 20020;
+            log.Add("  default port is " + AppEnv.DefaultPort + " (not 5000 / 8080)                             " +
+                    (portOk ? "-> OK" : "-> FAIL"));
+            ok &= portOk;
+
+            // 候选序列：先给的那个 → 顺着往后 SequentialTries 个（结果好预测、好念给人听）
+            var seq = new List<int>(PortPicker.Candidates(20020, 0));
+            var seqOk = seq.Count == PortPicker.SequentialTries
+                     && seq[0] == 20020
+                     && seq[seq.Count - 1] == 20020 + PortPicker.SequentialTries - 1;
+            log.Add("  port candidates: " + seq[0] + ".." + seq[seq.Count - 1] +
+                    " (" + seq.Count + ")                                    " +
+                    (seqOk ? "-> OK" : "-> FAIL"));
+            ok &= seqOk;
+
+            // 顺延段还不够就随机撒网：不重复、不越界（<1024 要管理员，>49151 是系统动态端口区）
+            var many = new List<int>(PortPicker.Candidates(20020, 20));
+            var uniqueOk = new HashSet<int>(many).Count == many.Count && many.Count > PortPicker.SequentialTries;
+            var inRangeOk = true;
+            foreach (var p in many)
+            {
+                if (p < PortPicker.MinPort || p > PortPicker.MaxPort) inRangeOk = false;
+            }
+            log.Add("  port candidates fall back to random, unique and in range              " +
+                    (uniqueOk && inRangeOk ? "-> OK" : "-> FAIL"));
+            ok &= uniqueOk && inRangeOk;
+
+            // 传进来一个不合法的端口（比如 80）就退回默认端口，而不是照着原样去绑
+            var lowSeq = new List<int>(PortPicker.Candidates(80, 0));
+            var lowOk = lowSeq.Count > 0 && lowSeq[0] == AppEnv.DefaultPort;
+            log.Add("  an unusable preferred port falls back to the default                  " +
+                    (lowOk ? "-> OK" : "-> FAIL"));
+            ok &= lowOk;
+
+            // ---- 退出房间：令牌校验 → 名册里删掉 → 令牌作废 ----
+            var settings = new ServerSettings(path);
+            var game = new GameState(settings);
+
+            var login = game.Login("conn-selfcheck", "Alice", string.Empty, "127.0.0.1");
+            var token = login.Token;
+            var leaveOk = login.Success && game.HasValidToken("Alice", token);
+
+            var wrongToken = game.Leave("Alice", "not-the-token");
+            leaveOk &= !wrongToken.Success && wrongToken.Code == LoginCodes.TokenMismatch;
+
+            var unknown = game.Leave("Nobody", token);
+            leaveOk &= !unknown.Success && unknown.Code == RoomCodes.NotFound;
+
+            var good = game.Leave("Alice", token);
+            leaveOk &= good.Success && game.Count == 0 && !game.HasValidToken("Alice", token);
+
+            var again = game.Leave("Alice", token);
+            leaveOk &= !again.Success && again.Code == RoomCodes.NotFound;
+
+            log.Add("  leave: token checked, row removed, token no longer valid                " +
+                    (leaveOk ? "-> OK" : "-> FAIL"));
+            ok &= leaveOk;
+
+            return ok;
         }
 
         private static bool Expect(List<string> log, Dictionary<string, double> measured,

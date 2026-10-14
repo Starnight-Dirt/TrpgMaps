@@ -71,6 +71,58 @@ body {
     border-color: #7a9aba;
 }
 
+/* 房间号：默认不显示 —— 只有 /join 页（没有二维码、号码手填）才由 JS 显示。
+   它是三个框里的第一个，所以显示时自己带下边距。 */
+#room-number-input {
+    display: none;
+    width: 100%;
+    margin-bottom: 10px;
+    padding: 12px 14px;
+    font-size: 16px;
+    border-radius: 10px;
+    border: 1px solid #7a9aba;
+    background: #1f1f1f;
+    color: #eee;
+    outline: none;
+    letter-spacing: 3px;
+}
+
+#room-number-input:focus {
+    border-color: #a8c4e0;
+}
+
+/* 房间密码：默认不显示（只有房间要密码、而地址里没带对时才由 JS 显示） */
+#room-pass-input {
+    display: none;
+    width: 100%;
+    margin-top: 10px;
+    padding: 12px 14px;
+    font-size: 16px;
+    border-radius: 10px;
+    border: 1px solid #8a6a2a;
+    background: #1f1f1f;
+    color: #f0c674;
+    outline: none;
+    letter-spacing: 2px;
+}
+
+#room-pass-input:focus {
+    border-color: #c0a050;
+}
+
+/* 房间号 / "房间已更换"提示 */
+#room-info {
+    display: none;
+    font-size: 13px;
+    color: #9ab;
+    margin-bottom: 12px;
+    letter-spacing: 1px;
+}
+
+#room-info.warn {
+    color: #f0c674;
+}
+
 #login-btn {
     width: 100%;
     margin-top: 14px;
@@ -176,4 +228,108 @@ body {
     width: 100%;
     height: 100%;
     pointer-events: none;
+}
+
+/* ---------- 右下角悬浮按钮（菜单） ----------
+   位置在**屏幕**坐标系里（fixed），所以转屏后浏览器自己会把它算回右下角；
+   拖动过之后由 JS 写 left/top，转屏时 JS 会把这两个内联样式清掉（= 归位）。 */
+#player-fab {
+    position: fixed;
+    right: 18px;
+    bottom: 18px;
+    width: 54px;
+    height: 54px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #fff;
+    background: linear-gradient(160deg, #5b7fa6, #3d5c7d);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.18);
+    z-index: 2200;
+    cursor: pointer;
+    touch-action: none;          /* 自己处理拖动，别让浏览器拿去滚页面 */
+    transition: transform 0.12s ease;
+}
+
+#player-fab:active {
+    transform: scale(0.94);
+}
+
+#player-fab.fab-hidden {
+    display: none;
+}
+
+/* 展开后的圆角面板。位置每打开一次都由 JS 算（保证整个面板都在屏幕里），
+   内容多了自己滚，但**不显示滚动条**。 */
+#player-fab-menu {
+    position: fixed;
+    z-index: 2210;
+    min-width: 168px;
+    max-height: 60vh;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 10px;
+    border-radius: 14px;
+    background: rgba(28, 28, 30, 0.96);
+    box-shadow: 0 8px 26px rgba(0, 0, 0, 0.6);
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;              /* Firefox */
+}
+
+#player-fab-menu::-webkit-scrollbar {
+    display: none;                      /* Chrome / Safari */
+}
+
+#player-fab-menu.fab-hidden {
+    display: none;
+}
+
+#exit-room-btn {
+    width: 100%;
+    padding: 12px 16px;
+    font-size: 15px;
+    border: 1px solid #7a4040;
+    border-radius: 10px;
+    background: #6a3838;
+    color: #ffdede;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+#exit-room-btn:active {
+    background: #7d4242;
+}
+
+#exit-room-btn:disabled {
+    opacity: 0.6;
+    cursor: default;
+}
+
+/* ---------- 顶部正中的胶囊提示（"xxx 离开了房间"） ---------- */
+#player-toast {
+    position: fixed;
+    top: 0;
+    left: 50%;
+    transform: translate(-50%, -140%);
+    z-index: 2600;
+    max-width: 80vw;
+    padding: 9px 20px;
+    border-radius: 999px;               /* 胶囊形 */
+    background: rgba(24, 24, 26, 0.94);
+    color: #f2f2f2;
+    font-size: 14px;
+    line-height: 1.2;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.55);
+    pointer-events: none;
+    transition: transform 0.26s cubic-bezier(0.22, 0.9, 0.3, 1.2), opacity 0.26s ease;
+    opacity: 0;
+}
+
+#player-toast.show {
+    transform: translate(-50%, 10px);
+    opacity: 1;
 }

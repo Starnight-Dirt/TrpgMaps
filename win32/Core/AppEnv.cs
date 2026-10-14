@@ -12,8 +12,21 @@ namespace TrpgMaps
     /// </summary>
     internal static class AppEnv
     {
-        /// <summary>默认监听端口（与原 Python 版一致）。</summary>
-        public const int DefaultPort = 5000;
+        /// <summary>
+        /// 默认监听端口。
+        ///
+        /// 为什么不是 5000 / 8080：
+        ///  - 5000 在老机器上常被别的程序占；更麻烦的是 Windows 给 Hyper-V / WSL / Docker 的
+        ///    `winnat` **预留**了一大段端口（`netsh int ipv4 show excludedportrange protocol=tcp`
+        ///    可查），实测这台机器就是 **4929–5028** 被圈走 —— 那种"占用"没有占用者可以杀，
+        ///    端口放行也救不回来，只能换号；
+        ///  - 80 / 443 / 8080 / 8443 这些是**国内未备案域名会被运营商直接阻断**的端口，
+        ///    以后想把服务挂到公网上时不能用。
+        ///
+        /// 所以挑一个五位、非 Web 惯例的号。绑不上也不怕：启动时会顺着往后找，
+        /// 直到找到一个真正绑得上的端口（见 <see cref="PortPicker"/>）。
+        /// </summary>
+        public const int DefaultPort = 20020;
 
         /// <summary>每厘米的像素基准（与原版一致：37.8 像素 = 1 厘米）。</summary>
         public const float PixelsPerCm = 37.8f;

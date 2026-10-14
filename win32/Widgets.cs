@@ -208,19 +208,30 @@ namespace TrpgMaps
         /// <summary>内容比可视区高出多少像素（0 = 装得下，不显示滑块）。</summary>
         public int OverflowHeight { get { return _maxOffset; } }
 
+        /// <summary>
+        /// 挂上（或切换）内容。
+        ///
+        /// ⚠️ 这里是**"藏起来"而不是"摘下来"**：`Controls.Remove` 会**销毁子控件的窗口句柄**，
+        /// 下次 `Controls.Add` 又得重建 —— 抽屉面板一棵树有 39 个控件，一次摘挂实测要
+        /// 70~200ms，正好就是"打开面板卡一下"的那一下。所以所有内容都一直挂在本容器上，
+        /// 同一时刻只有一个 `Visible`，句柄从头到尾活着。
+        /// </summary>
         public void SetContent(Control content)
         {
-            if (_content != null)
+            if (content == _content)
             {
-                Controls.Remove(_content);
-                _content.Dispose();
+                RefreshLayout();
+                return;
             }
+
+            if (_content != null) _content.Visible = false;
 
             _content = content;
 
             if (content != null)
             {
-                Controls.Add(content);
+                if (content.Parent != this) Controls.Add(content);
+                content.Visible = true;
             }
 
             _offset = 0;

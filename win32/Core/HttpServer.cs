@@ -114,7 +114,9 @@ namespace TrpgMaps
             header.Append("HTTP/1.1 ").Append(status).Append(' ').Append(StatusText(status)).Append("\r\n");
             header.Append("Content-Type: ").Append(contentType).Append("\r\n");
             header.Append("Content-Length: ").Append(body.Length).Append("\r\n");
-            header.Append("Cache-Control: no-cache\r\n");
+            header.Append("Cache-Control: no-store, no-cache, must-revalidate\r\n");
+            header.Append("Pragma: no-cache\r\n");
+            header.Append("Expires: 0\r\n");
             header.Append("Connection: ").Append(keepAlive ? "keep-alive" : "close").Append("\r\n");
             if (extraHeaders != null)
             {
@@ -235,7 +237,18 @@ namespace TrpgMaps
                 if (_running) return;
 
                 var listener = new TcpListener(IPAddress.Any, port);
-                listener.Start();
+                try
+                {
+                    listener.Start();
+                }
+                catch
+                {
+                    // ⚠️ 失败也要把 listener 关掉：否则这个"半死"的套接字会一直挂在进程里
+                    //    （换端口重试几十次就攒下几十个），而异常本身才是调用方要的信息。
+                    try { listener.Stop(); } catch { }
+                    throw;
+                }
+
                 _listener = listener;
                 _running = true;
 

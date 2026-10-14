@@ -20,8 +20,8 @@ function Check($name, $ok, $extra = '') {
     else { Write-Host ("  [FAIL] {0} {1}" -f $name, $extra); $script:fail++ }
 }
 
-# Port may not be 5000 (changed during the test); start on 5000 first
-$base = 'http://127.0.0.1:5000'
+# The default port (it may be changed during the test); start on it first
+$base = 'http://127.0.0.1:20020'
 
 # Deliberately NOT Start-Process: that goes through the shell (ShellExecute), and
 # when the caller's stdout is redirected to a file or pipe the launched GUI app
@@ -93,6 +93,104 @@ Check 'second player allowed' ($loginE.ok -eq $true) "msg=$($loginE.msg)"
 $tokenB = $loginE.token
 
 Write-Host ""
+Write-Host "=== 5b) room number / room password (v1.0.2) ==="
+$roomInfo = (Invoke-WebRequest "$base/api/room" -UseBasicParsing).Content | ConvertFrom-Json
+$room = [string]$roomInfo.room
+Check 'public room info returned' ([bool]$room) "room=$room"
+Check 'room number is 8 digits' ($room -match '^[1-9][0-9]{7}$') "room=$room"
+Check 'no password required by default' ($roomInfo.needPassword -eq $false)
+
+# the new address form: /<room>/player
+$page = Invoke-WebRequest "$base/$room/player" -UseBasicParsing
+Check 'player page served under /<room>/player' ($page.StatusCode -eq 200 -and $page.Content -match 'player-fab') "len=$($page.Content.Length)"
+$wrongPage = Invoke-WebRequest "$base/99999999/player" -UseBasicParsing
+Check 'stale room number still serves the page (client handles it)' ($wrongPage.StatusCode -eq 200)
+
+# set a room password
+$setPw = Api '/api/room/password' @{ password = 's3cret' }
+Check 'password set' ($setPw.success -eq $true -and $setPw.needPassword -eq $true) "msg=$($setPw.message)"
+Check 'player url carries the password' ($setPw.playerUrl -like "*/$room/player?passwd=s3cret*") $setPw.playerUrl
+
+$net = (Invoke-WebRequest "$base/api/network" -UseBasicParsing).Content | ConvertFrom-Json
+Check 'network payload carries the room' ($net.room -eq $room) "room=$($net.room)"
+Check 'network payload url has room + passwd' ($net.playerUrl -like "*:$($net.port)/$room/player?passwd=*") $net.playerUrl
+
+# stranger: no password / wrong password are both rejected
+$idP1 = NewSseId 'p1'
+$loginP1 = Api '/api/login' @{ id = $idP1; name = 'Dave'; token = ''; room = $room }
+Check 'stranger without password rejected' ($loginP1.ok -eq $false -and $loginP1.code -eq 'BAD_PASSWORD') "code=$($loginP1.code)"
+$idP2 = NewSseId 'p2'
+$loginP2 = Api '/api/login' @{ id = $idP2; name = 'Dave'; token = ''; room = $room; passwd = 'nope' }
+Check 'stranger with wrong password rejected' ($loginP2.ok -eq $false -and $loginP2.code -eq 'BAD_PASSWORD') "code=$($loginP2.code)"
+
+# a known player (valid token) does not have to retype the password
+$idP3 = NewSseId 'p3'
+$loginP3 = Api '/api/login' @{ id = $idP3; name = 'Bob'; token = $tokenB; room = $room }
+Check 'known player skips the password (token proves identity)' ($loginP3.ok -eq $true) "msg=$($loginP3.msg)"
+
+# the correct password lets a new player in
+$idP4 = NewSseId 'p4'
+$loginP4 = Api '/api/login' @{ id = $idP4; name = 'Dave'; token = ''; room = $room; passwd = 's3cret' }
+Check 'join with correct password allowed' ($loginP4.ok -eq $true) "msg=$($loginP4.msg)"
+$tokenD = $loginP4.token
+
+# /join: the manual-room-number login page (three boxes) and its check endpoint.
+# The page itself is the same player.html; player.js adds the room box for /join.
+$joinPage = Invoke-WebRequest "$base/join" -UseBasicParsing
+Check 'join page served (has the room-number box)' `
+    ($joinPage.StatusCode -eq 200 -and $joinPage.Content -match 'room-number-input') `
+    "len=$($joinPage.Content.Length)"
+
+$chkUnknown = (Invoke-WebRequest "$base/api/room?room=00000000" -UseBasicParsing).Content | ConvertFrom-Json
+Check 'join check: unknown room -> exists=false' ($chkUnknown.exists -eq $false) "exists=$($chkUnknown.exists)"
+
+$chkWrongPw = (Invoke-WebRequest "$base/api/room?room=$room&passwd=nope" -UseBasicParsing).Content | ConvertFrom-Json
+Check 'join check: right room + wrong password -> passwordOk=false' `
+    ($chkWrongPw.exists -eq $true -and $chkWrongPw.passwordOk -eq $false) "passwordOk=$($chkWrongPw.passwordOk)"
+
+$chkOk = (Invoke-WebRequest "$base/api/room?room=$room&passwd=s3cret" -UseBasicParsing).Content | ConvertFrom-Json
+Check 'join check: right room + right password' `
+    ($chkOk.exists -eq $true -and $chkOk.passwordOk -eq $true) "passwordOk=$($chkOk.passwordOk)"
+Check 'join check never leaks the password' `
+    ($chkOk.needPassword -eq $true -and -not ($chkOk.PSObject.Properties.Name -contains 'password'))
+Check 'login response carries the room' ($loginP4.room -eq $room) "room=$($loginP4.room)"
+
+# stale room number in the request = that room is gone
+$idP5 = NewSseId 'p5'
+$loginP5 = Api '/api/login' @{ id = $idP5; name = 'Dave'; token = $tokenD; room = '12345678'; passwd = 's3cret' }
+Check 'stale room number rejected with ROOM_GONE' ($loginP5.ok -eq $false -and $loginP5.code -eq 'ROOM_GONE') "code=$($loginP5.code)"
+
+Write-Host ""
+Write-Host "=== 5c) leave room (v1.0.2) ==="
+$leaveWrongRoom = Api '/api/leave' @{ room = '12345678'; name = 'Dave'; token = $tokenD }
+Check 'leave with stale room reports ROOM_GONE' ($leaveWrongRoom.success -eq $false -and $leaveWrongRoom.code -eq 'ROOM_GONE') "code=$($leaveWrongRoom.code)"
+
+$leaveBadToken = Api '/api/leave' @{ room = $room; name = 'Dave'; token = 'deadbeefdeadbeefdeadbeefdeadbeef' }
+Check 'leave with wrong token rejected' ($leaveBadToken.success -eq $false -and $leaveBadToken.code -eq 'TOKEN_MISMATCH') "code=$($leaveBadToken.code)"
+
+$playersBefore = @((Invoke-WebRequest "$base/api/players" -UseBasicParsing).Content | ConvertFrom-Json | ForEach-Object { $_.name })
+Check 'Dave still in roster after the failed leaves' ($playersBefore -contains 'Dave') ("roster=" + ($playersBefore -join ','))
+
+$leaveOk = Api '/api/leave' @{ room = $room; name = 'Dave'; token = $tokenD }
+Check 'leave with correct room+token succeeds' ($leaveOk.success -eq $true) "msg=$($leaveOk.message)"
+
+$playersAfter = @((Invoke-WebRequest "$base/api/players" -UseBasicParsing).Content | ConvertFrom-Json | ForEach-Object { $_.name })
+Check 'Dave removed from roster' (-not ($playersAfter -contains 'Dave')) ("roster=" + ($playersAfter -join ','))
+Check 'other players untouched' ($playersAfter -contains 'Alice' -and $playersAfter -contains 'Bob') ("roster=" + ($playersAfter -join ','))
+
+# the room forgot him: the old token no longer counts as a known identity
+$idP6 = NewSseId 'p6'
+$loginP6 = Api '/api/login' @{ id = $idP6; name = 'Dave'; token = $tokenD; room = $room }
+Check 'old token no longer proves identity after leaving' ($loginP6.ok -eq $false -and $loginP6.code -eq 'BAD_PASSWORD') "code=$($loginP6.code)"
+
+# clear the password: strangers may join again
+$clearPw = Api '/api/room/password' @{ password = '' }
+Check 'password cleared' ($clearPw.success -eq $true -and $clearPw.needPassword -eq $false) "msg=$($clearPw.message)"
+$idP7 = NewSseId 'p7'
+$loginP7 = Api '/api/login' @{ id = $idP7; name = 'Eve'; token = ''; room = $room }
+Check 'join allowed again after clearing password' ($loginP7.ok -eq $true) "msg=$($loginP7.msg)"
+
+Write-Host ""
 Write-Host "=== 6) lock the room ==="
 $lock = Api '/api/room/lock' @{ locked = $true }
 Check 'room locked' ($lock.success -eq $true -and $lock.locked -eq $true)
@@ -134,7 +232,7 @@ $mapsBefore = ((Invoke-WebRequest "$base/api/maps" -UseBasicParsing).Content | C
 $playersBefore = ((Invoke-WebRequest "$base/api/players" -UseBasicParsing).Content | ConvertFrom-Json).Count
 Write-Host "     before restart: maps=$mapsBefore players=$playersBefore"
 
-$newPort = 5123
+$newPort = 22022
 Write-Host ""
 Write-Host "=== 10) save new ip/port: server reopens, state preserved ==="
 $save = (Invoke-WebRequest "$base/api/settings" -Method POST -Body (@{ ip = $settings.listenIp; port = $newPort } | ConvertTo-Json) -ContentType 'application/json' -UseBasicParsing).Content | ConvertFrom-Json
@@ -153,7 +251,7 @@ Check 'service reachable on new port' $ok2
 
 if ($ok2) {
     $net2 = (Invoke-WebRequest "$base2/api/network" -UseBasicParsing).Content | ConvertFrom-Json
-    Check 'player url uses new port' ($net2.playerUrl -like "*:$newPort/player") $net2.playerUrl
+    Check 'player url uses new port' ($net2.playerUrl -like "*:$newPort/$room/player*") $net2.playerUrl
     $mapsAfter = ((Invoke-WebRequest "$base2/api/maps" -UseBasicParsing).Content | ConvertFrom-Json).images.Count
     Check 'maps preserved after restart' ($mapsAfter -eq $mapsBefore) "maps=$mapsAfter"
     $playersAfter = ((Invoke-WebRequest "$base2/api/players" -UseBasicParsing).Content | ConvertFrom-Json).Count
@@ -172,9 +270,9 @@ if ($ok2) {
     $badIp = (Invoke-WebRequest "$base2/api/settings" -Method POST -Body (@{ ip = '10.99.99.99'; port = $newPort } | ConvertTo-Json) -ContentType 'application/json' -UseBasicParsing).Content | ConvertFrom-Json
     Check 'foreign ip rejected' ($badIp.success -eq $false) "msg=$($badIp.message)"
 
-    # Restore port 5000 so later smoke tests are unaffected
-    $restore = (Invoke-WebRequest "$base2/api/settings" -Method POST -Body (@{ ip = $settings.listenIp; port = 5000 } | ConvertTo-Json) -ContentType 'application/json' -UseBasicParsing).Content | ConvertFrom-Json
-    Check 'port restored to 5000' ($restore.success -eq $true) "port=$($restore.port)"
+    # Restore the default port so later smoke tests are unaffected
+    $restore = (Invoke-WebRequest "$base2/api/settings" -Method POST -Body (@{ ip = $settings.listenIp; port = 20020 } | ConvertTo-Json) -ContentType 'application/json' -UseBasicParsing).Content | ConvertFrom-Json
+    Check 'port restored to the default' ($restore.success -eq $true) "port=$($restore.port)"
 }
 
 Write-Host ""

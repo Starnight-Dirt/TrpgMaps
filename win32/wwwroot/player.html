@@ -12,7 +12,13 @@
         <div id="login-box">
             <h2>🎲 加入游戏</h2>
             <div id="room-lock-notice">🔒 房间已锁定</div>
+            <div id="room-info"></div>
+            <!-- 房间号：只有 `/join` 页才显示（那里没有二维码可扫，号码得手填） -->
+            <input type="text" id="room-number-input" placeholder="房间号（8 位数字）" maxlength="12"
+                   inputmode="numeric" autocomplete="off">
             <input type="text" id="player-name-input" placeholder="输入你的玩家名称" maxlength="20">
+            <!-- 只有"这个房间有密码、而地址里没带对密码"时才出现（见 player.js 的 updatePasswordField） -->
+            <input type="password" id="room-pass-input" placeholder="房间密码" maxlength="32" autocomplete="off">
             <button id="login-btn">进入</button>
             <div id="login-error" class="error"></div>
             <div id="login-info" class="info"></div>
@@ -33,6 +39,30 @@
             <canvas id="player-draw-canvas"></canvas>
             <canvas id="player-grid-canvas"></canvas>
         </div>
+    </div>
+
+    <!-- 顶部正中的胶囊提示条（"xxx 离开了房间"）：从屏幕上方滑下来、2 秒后缩回 -->
+    <div id="player-toast"></div>
+
+    <!--
+        右下角悬浮按钮 + 展开后的圆角面板。
+
+        ⚠️ 它们**不在** #player-map-wrapper 里面：地图那块是跟着 extra 一起转的，
+        而这两个要的是"相对**屏幕**永远在右下角"（见 player.js 的 resetFabPosition）。
+        固定在 fixed 坐标系里，转屏之后浏览器自己会把 right/bottom 重新算一遍。
+    -->
+    <div id="player-fab" class="fab-hidden" role="button" aria-label="菜单">
+        <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true">
+            <path d="M4 3h9a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z"
+                  fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>
+            <path d="M13 12h8m0 0-3-3m3 3-3 3"
+                  fill="none" stroke="currentColor" stroke-width="1.7"
+                  stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+    </div>
+
+    <div id="player-fab-menu" class="fab-hidden">
+        <button id="exit-room-btn">退出房间</button>
     </div>
 
     <script src="/js/realtime.js"></script>

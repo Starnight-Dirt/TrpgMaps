@@ -65,7 +65,8 @@
             // （room_state / server_moved 以前漏掉了：锁房间和服务器换 IP 都不通知玩家，
             //   player.js 里那两个处理器形同虚设。）
             const names = ['connected', 'login_success', 'login_failed', 'map_change',
-                'player_list', 'kicked', 'pong', 'room_state', 'server_moved', 'drawing_change'];
+                'player_list', 'player_left', 'kicked', 'pong', 'room_state', 'server_moved',
+                'drawing_change'];
             for (const name of names) {
                 es.addEventListener(name, (e) => {
                     let payload = null;

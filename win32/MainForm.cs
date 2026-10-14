@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 namespace TrpgMaps
@@ -15,6 +17,25 @@ namespace TrpgMaps
             SetStyle(ControlStyles.AllPaintingInWmPaint |
                      ControlStyles.UserPaint |
                      ControlStyles.OptimizedDoubleBuffer, true);
+        }
+    }
+
+    /// <summary>
+    /// 支持双缓冲的 FlowLayoutPanel。
+    ///
+    /// 抽屉面板的内容容器、以及**每一行**的容器都是 FlowLayoutPanel：打开面板时
+    /// 会一次性塞进几十个控件，普通 FlowLayoutPanel 在这期间会把自己（以及每行）的
+    /// 背景反复擦掉重画，"底板发闪"就有它一份。双缓冲属性在 FlowLayoutPanel 上是
+    /// protected，只能靠子类打开。
+    /// </summary>
+    internal sealed class BufferedFlowPanel : FlowLayoutPanel
+    {
+        public BufferedFlowPanel()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint |
+                     ControlStyles.UserPaint |
+                     ControlStyles.OptimizedDoubleBuffer, true);
+            DoubleBuffered = true;
         }
     }
 
@@ -48,6 +69,154 @@ namespace TrpgMaps
 
         private enum PanelKind { None, Map, Network, About }
 
+        // ============================================================
+        //  绘制性能：整窗合成 + 同步重画
+        // ============================================================
+
+        /// <summary>`--no-composited`：关掉整窗合成（老机器 / 驱动异常时的退路）。</summary>
+        internal static bool SuppressComposited;
+
+        /// <summary>`--no-anim`：面板/侧栏的滑入淡出**不做动画**，一步到位。</summary>
+        internal static bool SuppressPanelAnimation;
+
+        private const int WsExComposited = 0x02000000;
+
+        /// <summary>
+        /// 给顶层窗口加 `WS_EX_COMPOSITED` —— **整窗（含所有子控件）先合成到离屏、
+        /// 再一次性贴到屏幕上**。
+        ///
+        /// 为什么非动 Win32 扩展样式不可：抽屉面板是"一块底板 + 一堆各自双缓冲的行"拼出来的，
+        /// 而 Windows 给每个**子控件**发的是各自的 `WM_PAINT`。父窗口（底板）先画完、
+        /// 每一行再一个个画，中间那一两帧就上屏了 —— 看起来就是
+        /// **"先出一圈边框，其余地方慢一步刷新"**；从别的面板切过来时，那些还没轮到
+        /// 重画的小块**还留着上一个面板的内容**。子控件各自双缓冲只能防"自己闪自己"，
+        /// 挡不住这种"父子不同步"。
+        ///
+        /// ⚠️ 界面截图走的是 `CopyFromScreen`（屏幕实拍），合不合成都能拍到最终画面，
+        /// 所以这个改动不影响 `--ui` 截图。
+        /// </summary>
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                var cp = base.CreateParams;
+                if (!SuppressComposited)
+                {
+                    cp.ExStyle |= WsExComposited;
+                }
+                return cp;
+            }
+        }
+
+        private const uint RdwInvalidate = 0x0001;
+        private const uint RdwErase = 0x0004;
+        private const uint RdwAllChildren = 0x0080;
+        private const uint RdwUpdateNow = 0x0100;
+
+        [DllImport("user32.dll")]
+        private static extern bool RedrawWindow(IntPtr hWnd, IntPtr lprcUpdate,
+                                                IntPtr hrgnUpdate, uint flags);
+
+        /// <summary>
+        /// **立刻**把一棵控件树（含所有子控件）整个重画一遍，同步、不排队。
+        ///
+        /// 平时父控件和子控件各自排队等 `WM_PAINT`，所以"刚显示出来的那一帧"经常是残缺的。
+        /// 在**让用户看到之前**（显示之后、消息循环轮到之前）强制整棵树画完，
+        /// 第一帧就是完整的。面板只有几百像素宽，这一步的开销可以忽略。
+        /// </summary>
+        private static void PaintTreeNow(Control root)
+        {
+            if (root == null || root.IsDisposed || !root.IsHandleCreated) return;
+            // 刻意**不带 RDW_ERASE**：本程序的控件都在 OnPaint 里自己填背景
+            // （ControlStyles.AllPaintingInWmPaint），再擦一遍纯属重复劳动。
+            RedrawWindow(root.Handle, IntPtr.Zero, IntPtr.Zero,
+                RdwInvalidate | RdwAllChildren | RdwUpdateNow);
+        }
+
+        /// <summary>数一棵控件树有多少个控件（诊断用）。</summary>
+        private static int CountControls(Control root)
+        {
+            if (root == null) return 0;
+            var n = 1;
+            foreach (Control c in root.Controls) n += CountControls(c);
+            return n;
+        }
+
+        /// <summary>
+        /// 【第二十五轮】窗口尺寸变了之后**把整棵树重新刷一遍**。
+        ///
+        /// 为什么非刷不可：整窗合成（`WS_EX_COMPOSITED`）下，合成引擎给整扇窗留着一块
+        /// 离屏位图，而它**只更新被标脏的那部分**。窗口变大时（全屏↔窗口化是最大幅的一次）
+        /// 新露出来的那一圈**从来没人给系统发过"这里需要重画"** ⇒ 那块位图始终是空的
+        /// （没写过像素）⇒ 贴到屏幕上就是**透明的**，于是直接透出底下的窗口。
+        /// 看上去正好是**右边一条 + 下边一条**（窗口是从左上往右下长的），
+        /// 而鼠标一碰上去那块就失效、被重画，所以"点一下才刷出来"。
+        ///
+        /// 我们自己把整棵树的失效区叫起来，那块位图就有像素了。
+        /// </summary>
+        /// <param name="hard">
+        /// true = 全屏切换这种一次性大跳变（此时连"没变尺寸的兄弟控件"也一起刷，
+        /// 免得边角上留缝）；false = 拖边框那种连发场景，只按需补。
+        /// </param>
+        private void ForceFullRedraw(bool hard)
+        {
+            // 没开整窗合成时，系统自己会把新露出来的区域标脏，不用我们管。
+            if (SuppressComposited) return;
+            if (!IsHandleCreated || IsDisposed) return;
+            if (_forceRedrawBusy) return;
+            if (ClientSize.Width <= 0 || ClientSize.Height <= 0) return;
+
+            _forceRedrawBusy = true;
+            try
+            {
+                // hard 时把窗口自身（含边角）也一并失效：窗口自身那块平时被画布盖着，
+                // 但它和画布是两扇窗，只失效画布的话，四角那一两个像素会留下没写过的地方。
+                if (hard) Invalidate(true);
+                PaintTreeNow(this);
+            }
+            finally
+            {
+                _forceRedrawBusy = false;
+            }
+        }
+
+        /// <summary>
+        /// 排一次"尺寸变完之后补画"（防抖 80ms）。
+        ///
+        /// 拖边框时 `OnResize` 会连发几十次，每次都整棵树重画太浪费；攒到停手再画一次。
+        /// 而全屏切换那次是在 `ApplyFullscreen` 里**立刻**画（见那里的调用），
+        /// 这里这一发是兜底：合成引擎换表面尺寸有时晚一拍。
+        /// </summary>
+        private void ScheduleResizeRepaint()
+        {
+            if (SuppressComposited || _forceRedrawBusy) return;
+            if (!IsHandleCreated || IsDisposed) return;
+            _resizeRepaintTimer.Stop();
+            _resizeRepaintTimer.Start();
+        }
+
+        /// <summary>
+        /// 全屏切换之后再补一次**更晚**的（320ms）。
+        ///
+        /// 合成引擎给整扇窗换表面尺寸有可能晚不止一拍，80ms 那发（`ScheduleResizeRepaint`）
+        /// 说不定赶在它前面；多发一发只多花几十毫秒 CPU，换的是"不留一块透出底下窗口的空洞"。
+        /// </summary>
+        private void ScheduleLateRedraw()
+        {
+            if (SuppressComposited) return;
+
+            var t = new Timer();
+            t.Interval = 320;
+            t.Tick += delegate
+            {
+                t.Stop();
+                t.Dispose();
+                if (IsDisposed) return;
+                ForceFullRedraw(false);
+            };
+            t.Start();
+        }
+
         private readonly ServerSettings _settings;
         private readonly MapStore _maps;
         private readonly GameState _game;
@@ -65,6 +234,10 @@ namespace TrpgMaps
         private bool _sidebarExpanded;
         private double _sidebarWidth = SidebarPanel.CollapsedWidth;
         private double _panelSlide;
+        /// <summary>上一次给面板设过圆角 Region 时的尺寸。只在尺寸变了才重设（见 LayoutChildren）。</summary>
+        private Size _regionSize = Size.Empty;
+        /// <summary>侧栏上一次重画时的文字不透明度（配合 LayoutChildren 省掉无用重画）。</summary>
+        private double _lastSidebarOpacity = -1;
         private double _maskOpacity;
         private PanelKind _panelOpen = PanelKind.None;
         private int _panelWidth = 360;
@@ -102,6 +275,14 @@ namespace TrpgMaps
         private readonly Timer _animTimer = new Timer();
         private readonly Timer _addressTimer = new Timer();
         private readonly Timer _playerTimer = new Timer();
+
+        /// <summary>
+        /// 窗口尺寸变了之后补一次"整棵树同步重画"，防抖 80ms（见 <see cref="ScheduleResizeRepaint"/>）。
+        /// </summary>
+        private readonly Timer _resizeRepaintTimer = new Timer();
+
+        /// <summary>正在整树重画（见 <see cref="ForceFullRedraw"/>）—— 挡住重入，免得自己套自己。</summary>
+        private bool _forceRedrawBusy;
 
         /// <summary>
         /// 网格锚点的防抖广播。画布尺寸一变（全屏↔窗口、拖边框），底图就重新居中，
@@ -158,9 +339,19 @@ namespace TrpgMaps
         private Label _urlLabel;
         private ModernList _playerList;
         private Button _roomLockButton;
+        private Label _roomLabel;
+        private ModernTextBox _roomPassBox;
+        private Button _roomSaveButton;
         private List<LocalAddress> _addresses = new List<LocalAddress>();
         private string _playersSignature;
         private string _qrCacheKey;
+
+        // 顶部胶囊提示（"xxx 离开了房间"）：内容与动画都在这里推，
+        // 真正画在 MapCanvas 上（见 MapCanvas.SetToast）。
+        private readonly Timer _toastTimer = new Timer();
+        private string _toastText = string.Empty;
+        private int _toastPhase;
+        private int _toastPhaseStart;
 
         // ---- 绘图 ----
         /// <summary>绘图数据（地形 / 实体 / 物品 + 落盘）。</summary>
@@ -227,8 +418,15 @@ namespace TrpgMaps
             // 「网格 ↔ 底图」的几何只有画布知道，注入一个取快照的委托给它
             // （手机端靠这几个数把绘图摆到底图上，见 GridAnchor）。
             _routes.AttachGridAnchor(delegate { return _canvas == null ? null : _canvas.AnchorSnapshot; });
+            // 有玩家退出房间时要立刻在界面上弹一条胶囊提示（见 ShowPlayerLeftToast）。
+            _routes.AttachPlayerLeft(ShowPlayerLeftToast);
+
+            AppLog.Write("房间号：" + _settings.RoomNumber +
+                         "，房间密码：" + (_settings.RoomHasPassword ? "已设置" : "无"));
 
             DoubleBuffered = true;
+            AppLog.Write("绘制模式：整窗合成(WS_EX_COMPOSITED)=" + (!SuppressComposited) +
+                         "，面板/侧栏动画=" + (!SuppressPanelAnimation));
             KeyPreview = true;
             Text = "TrpgMaps";
             ApplyAppIcon();
@@ -254,6 +452,19 @@ namespace TrpgMaps
             // 网格锚点变了才播（见 ScheduleAnchorBroadcast）；600ms 足够滤掉拖边框的连发
             _anchorTimer.Interval = 600;
             _anchorTimer.Tick += delegate { _anchorTimer.Stop(); BroadcastAnchorIfChanged(); };
+
+            // 窗口尺寸变完之后补画一次（见 ScheduleResizeRepaint）——
+            // 整窗合成下"窗口变大后新露出的那一圈"不补就是空的（透出底下的窗口）。
+            _resizeRepaintTimer.Interval = 80;
+            _resizeRepaintTimer.Tick += delegate
+            {
+                _resizeRepaintTimer.Stop();
+                ForceFullRedraw(false);
+            };
+
+            // 顶部胶囊提示的动画（下滑 → 停 2 秒 → 缩回，见 ToastTick）
+            _toastTimer.Interval = 15;
+            _toastTimer.Tick += delegate { ToastTick(); };
 
             // 每 200ms 对一次底图状态：HTTP 改的 MapStore 碰不到控件，这里兜住
             // （见 SyncCanvasWithStore）。200ms 对一次纯内存比较，代价可以忽略。
@@ -430,11 +641,34 @@ namespace TrpgMaps
             }
 
             LayoutChildren();
+
+            // 【第二十五轮】全屏↔窗口化是一次性的**大跳变**（1200x800 ↔ 整块屏幕），
+            // 而整窗合成（`WS_EX_COMPOSITED`）下，窗口变大后新露出来的那一圈**不会被标脏**
+            // —— 那块像素从来没被合成过，于是直接透出底下的窗口（用户报的
+            // "下边和右边是空的、能看见底下的窗口，点一下才刷出来"）。
+            // 这里立刻补一次；80ms 那发见 ScheduleResizeRepaint()，更晚的 320ms 见 ScheduleLateRedraw()。
+            ForceFullRedraw(true);
+            ScheduleLateRedraw();
         }
 
         protected override void OnShown(EventArgs e)
         {
             base.OnShown(e);
+
+            // 启动后空闲时**预热三个抽屉面板**（不挡启动、不挡截图）。
+            if (!Headless)
+            {
+                var warmer = new Timer();
+                warmer.Interval = 1200;
+                warmer.Tick += delegate
+                {
+                    warmer.Stop();
+                    warmer.Dispose();
+                    try { WarmPanelCache(); }
+                    catch (Exception ex) { AppLog.Write("面板预热失败（不影响使用）", ex); }
+                };
+                warmer.Start();
+            }
 
             // 先查防火墙，再起服务。顺序不能反：
             // 防火墙没放行时，用户需要"一键修复"，而修复要在局域网真正可用之前做完；
@@ -445,20 +679,7 @@ namespace TrpgMaps
             // 无人值守时那个框没人点，会一直挂在桌面上挡住后续流程。
             if (!NoServer)
             {
-                try
-                {
-                    _server.Start(_settings.Port);
-                    AppLog.Write("Web 服务器已启动：" + _settings.PlayerUrl);
-                }
-                catch (Exception ex)
-                {
-                    AppLog.Write("启动 Web 服务器失败（端口 " + _settings.Port + "）", ex);
-                    if (!Headless)
-                    {
-                        MessageBox.Show(this, "内置服务器启动失败，端口可能被占用：\r\n" + ex.Message,
-                            "TrpgMaps", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    }
-                }
+                StartWebServer();
             }
             else
             {
@@ -662,54 +883,78 @@ namespace TrpgMaps
                 timer.Interval = 150;
                 timer.Tick += delegate
                 {
-                    if (index >= steps.Count)
+                    // ⚠️ 下面 SaveUiShot 之前会调 DoEvents()，而 DoEvents 会把定时器消息
+                    //    重入地派发回来 —— 于是同一步会被执行第二次（`fs` 模式里跑出过
+                    //    "面板已就绪" 刷 253 次的活锁）。这里拿一个标志把重入挡掉。
+                    if (_shotBusy) return;
+                    _shotBusy = true;
+                    try
                     {
-                        timer.Stop();
-                        timer.Dispose();
-                        Close();
-                        return;
-                    }
+                        if (index >= steps.Count)
+                        {
+                            timer.Stop();
+                            timer.Dispose();
+                            Close();
+                            return;
+                        }
 
-                    if (countdown == 0)
+                        if (countdown == 0)
+                        {
+                            try
+                            {
+                                ApplyShotMode(steps[index].Mode);
+                            }
+                            catch (Exception ex)
+                            {
+                                AppLog.Write("截图步骤失败：" + steps[index].Mode, ex);
+                            }
+                            // 150ms × 8 ≈ 1.2s：等侧栏宽度动画、淡入动画和面板延迟加载都跑完
+                            countdown = 8;
+                            return;
+                        }
+
+                        countdown--;
+                        if (countdown > 0) return;
+
+                        var step = steps[index];
+                        index++;
+
+                        // 先把真实子窗口 z 序和关键几何记下来，再抓图。顺序很重要：
+                        // z 序是"到底谁盖住谁"的唯一权威答案，几何是"缝隙到底几像素"的唯一答案。
+                        LogChildZOrder();
+                        LogLayout();
+
+                        Activate();
+                        BringToFront();
+                        Update();
+                        Application.DoEvents();
+
+                        SaveUiShot(step.Path);
+                    }
+                    finally
                     {
-                        try
-                        {
-                            ApplyShotMode(steps[index].Mode);
-                        }
-                        catch (Exception ex)
-                        {
-                            AppLog.Write("截图步骤失败：" + steps[index].Mode, ex);
-                        }
-                        // 150ms × 8 ≈ 1.2s：等侧栏宽度动画、淡入动画和面板延迟加载都跑完
-                        countdown = 8;
-                        return;
+                        _shotBusy = false;
                     }
-
-                    countdown--;
-                    if (countdown > 0) return;
-
-                    var step = steps[index];
-                    index++;
-
-                    // 先把真实子窗口 z 序和关键几何记下来，再抓图。顺序很重要：
-                    // z 序是"到底谁盖住谁"的唯一权威答案，几何是"缝隙到底几像素"的唯一答案。
-                    LogChildZOrder();
-                    LogLayout();
-
-                    Activate();
-                    BringToFront();
-                    Update();
-                    Application.DoEvents();
-
-                    SaveUiShot(step.Path);
                 };
                 timer.Start();
             };
         }
 
+        /// <summary>截图定时器的重入闸（见 ScheduleUiShot 里的说明）。</summary>
+        private bool _shotBusy;
+
         private static List<ShotStep> BuildShotSteps(string mode, string path)
         {
             var steps = new List<ShotStep>();
+
+            if (string.Equals(mode, "fs", StringComparison.OrdinalIgnoreCase))
+            {
+                // 全屏往返自检：两步走，每步都吃满框架自带的 1.2s 静置（等动画和延迟加载收尾），
+                // 两张图只在"有没有做全屏往返"这一点上不同 ⇒ 逐像素一比就知道漏没漏刷。
+                steps.Add(new ShotStep("fsa", Path.Combine(path, "fs-a.png")));
+                steps.Add(new ShotStep("fsb", Path.Combine(path, "fs-b.png")));
+                return steps;
+            }
 
             if (string.Equals(mode, "all", StringComparison.OrdinalIgnoreCase))
             {
@@ -885,6 +1130,21 @@ namespace TrpgMaps
                                      "\" 内宽=" + inner.Width);
                     }
                 }
+
+                // 玩家地址那几行到底放不放得下 —— 用**真实字体**量一遍再写进日志。
+                // （那一行带 IP + 房间号 + 密码，靠眼睛看截图只能看出"像是被截了"。）
+                if (_urlLabel != null && _urlLabel.Visible)
+                {
+                    var widest = 0;
+                    foreach (var line in _urlLabel.Text.Split('\n'))
+                    {
+                        var width = TextRenderer.MeasureText(line, _urlLabel.Font).Width;
+                        if (width > widest) widest = width;
+                    }
+                    AppLog.Write("玩家地址显示 = \"" + Preview(_urlLabel.Text.Replace("\n", " / ")) +
+                                 "\"  最宽一行 " + widest + "px / 可用 " + _urlLabel.Width + "px" +
+                                 (widest <= _urlLabel.Width ? "  -> 放得下" : "  -> 会被截断"));
+                }
             }
             catch (Exception ex)
             {
@@ -1005,7 +1265,45 @@ namespace TrpgMaps
                     _drawPanel.SetupShotBrushVisible((int)_sidebarWidth, _drawPanel.Left, _canvas.Width,
                         BrushShape.Sphere, 3);
                     break;
+                case "fsa":            // 全屏往返自检第 1 步：摆好 + 进全屏，**延时强制补画**一次
+                    // 600ms 后（框架抓图前的静置期里）把整棵树补画一遍 ⇒ 这张是"正确的全屏画面"，
+                    // 当作 `fs-b.png` 的对照基准。不补的话它自己可能也是漏刷的，就没法比了。
+                    ApplyShotSidebarWidth(true);
+                    SelectFirstMapForShot();
+                    OpenPanel(PanelKind.Map);
+                    ApplyFullscreen(true);
+                    ScheduleShotForceRepaint();
+                    break;
+                case "fsb":            // 全屏往返自检第 2 步：退出全屏 → 重新全屏（用户报的那一步）
+                    // 这里**故意什么都不补**：全屏变大后新露出的那圈到底刷不刷，就看它自己。
+                    ApplyFullscreen(false);
+                    ApplyFullscreen(true);
+                    break;
+                case "toast":          // 顶部胶囊提示（"xxx 离开了房间"）停住的样子
+                    // 框架在 1.2s 后抓图，正好落在"下滑完 → 停留 2 秒"那一段里。
+                    ApplyShotSidebarWidth(true);
+                    SelectFirstMapForShot();
+                    ShowPlayerLeftToast("测试玩家");
+                    break;
             }
+        }
+
+        /// <summary>
+        /// `--ui fs` 用：600ms 后（框架抓图之前）把整棵树**强制**同步补画一遍。
+        /// </summary>
+        private void ScheduleShotForceRepaint()
+        {
+            var t = new Timer();
+            t.Interval = 600;
+            t.Tick += delegate
+            {
+                t.Stop();
+                t.Dispose();
+                if (IsDisposed || !IsHandleCreated) return;
+                PaintTreeNow(this);
+                AppLog.Write("截图：已在 600ms 处强制整树补画（作 `fs-a.png` 的基准画面）");
+            };
+            t.Start();
         }
 
         /// <summary>跳过动画，直接把侧栏摆到目标宽度（截图用）。</summary>
@@ -1059,7 +1357,90 @@ namespace TrpgMaps
             try { _server.Stop(); } catch { /* 忽略 */ }
             if (_drawCache != null) _drawCache.Dispose();
             DisposeThumbnails();
+            DisposePanelCache();
             base.OnFormClosing(e);
+        }
+
+        /// <summary>
+        /// 释放缓存着的面板内容树。它们平时是"摘下来存着"的（不在控件树里），
+        /// 所以窗口自己的 Dispose 管不到，得手动收。
+        /// </summary>
+        private void DisposePanelCache()        {
+            foreach (var entry in _panelCache.Values)
+            {
+                if (entry == null || entry.Content == null) continue;
+                if (entry.Content == _panelContent) continue;      // 当前挂着的那个随窗口一起收
+                if (!entry.Content.IsDisposed) entry.Content.Dispose();
+            }
+            _panelCache.Clear();
+        }
+
+        /// <summary>
+        /// 预热三个抽屉面板：先建好放进缓存，然后再收起来（面板仍然是关着的）。
+        ///
+        /// 第一次建一个面板要 ~340ms（39 个控件的窗口句柄 + 第一次绘制），
+        /// 如果等用户点开时才建，那一下就是明显的卡顿。启动空闲时先建好，
+        /// 用户第一次点「地图设置」拿到的就是"热"的那一份（≈170ms，且第一帧完整）。
+        /// </summary>
+        private void WarmPanelCache()
+        {
+            if (_busy || _panelOpen != PanelKind.None) return;   // 用户已经在用面板了，别去动它
+
+            // 用和 OpenPanel 一样的算式定宽度，这样建出来的行宽就是之后显示要用的那份
+            // （万一之后窗口尺寸变了，HasUsablePanelCache 会判它作废并重建，见那里）。
+            _panelWidth = Clamp((int)(ClientSize.Width * 0.25), 300, 420);
+            _contentWidth = _panelWidth - PanelInset * 2;
+
+            foreach (var kind in new[] { PanelKind.Map, PanelKind.Network, PanelKind.About })
+            {
+                if (HasUsablePanelCache(kind)) continue;
+                try
+                {
+                    var sw = Stopwatch.StartNew();
+                    BuildPanelContent(kind);
+                    AppLog.Write("面板预热（" + kind + "）：" + sw.ElapsedMilliseconds + "ms");
+                }
+                catch (Exception ex)
+                {
+                    AppLog.Write("面板预热失败：" + kind + "（不影响使用）", ex);
+                }
+            }
+
+            // 光把控件建出来还不够：**窗口句柄**是"控件第一次出现在可见窗口里"时才创建的，
+            // 那一步实测要 70~200ms —— 用户第一次点开面板卡的那一下就是它。
+            // 所以这里把宿主**摆到屏幕外**显示一次再藏回去：句柄建好了，
+            // 而整个过程不跑消息循环、位置又在屏幕外，屏幕上什么都不会出现。
+            var sw2 = Stopwatch.StartNew();
+            var keepHost = _panelHost.Bounds;
+            var keepScroll = _panelScroll.Bounds;
+            var w = Math.Max(1, _panelWidth);
+            var h = Math.Max(1, ClientSize.Height);
+            _panelHost.Bounds = new Rectangle(-20000, 0, w, h);
+            _panelScroll.Bounds = new Rectangle(0, 0, w, h);
+
+            foreach (var entry in _panelCache.Values)
+            {
+                if (entry != null && entry.Content != null) entry.Content.Visible = true;
+            }
+            _panelHost.Visible = true;
+            PaintTreeNow(_panelHost);
+            _panelHost.Visible = false;
+            foreach (var entry in _panelCache.Values)
+            {
+                if (entry != null && entry.Content != null) entry.Content.Visible = false;
+            }
+
+            _panelHost.Bounds = keepHost;
+            _panelScroll.Bounds = keepScroll;
+            AppLog.Write("面板预热：句柄预建 " + sw2.ElapsedMilliseconds + "ms");
+
+            // 预热只是"借位置摆一下"，摆完收回去：面板仍然是关着的。
+            _panelScroll.SetContent(null);
+            ClearPanelReferences();
+            _panelContent = null;
+            _panelOpen = PanelKind.None;
+            _panelHost.Visible = false;
+            _canvas.PanelRect = Rectangle.Empty;
         }
 
         // ============================================================
@@ -1080,7 +1461,19 @@ namespace TrpgMaps
             if (ClientSize.Width <= 0 || ClientSize.Height <= 0) return;
 
             _canvas.Bounds = new Rectangle(0, 0, ClientSize.Width, ClientSize.Height);
-            _sidebar.Bounds = new Rectangle(0, 0, (int)Math.Round(_sidebarWidth), ClientSize.Height);
+
+            // 侧栏只在"真的变了"的时候才重画（宽度动画 / 文字淡入那两件事）。
+            // 以前这里每帧无条件 Invalidate()：面板滑入的几十帧里，侧栏一动不动却
+            // 被整块重画了几十遍 —— 纯浪费。
+            var sidebarW = (int)Math.Round(_sidebarWidth);
+            if (_sidebar.Bounds.Width != sidebarW ||
+                _sidebar.Bounds.Height != ClientSize.Height ||
+                Math.Abs(_sidebar.TextOpacity - _lastSidebarOpacity) > 0.001)
+            {
+                _sidebar.Bounds = new Rectangle(0, 0, sidebarW, ClientSize.Height);
+                _sidebar.Invalidate();
+                _lastSidebarOpacity = _sidebar.TextOpacity;
+            }
 
             if (_panelOpen != PanelKind.None)
             {
@@ -1088,12 +1481,20 @@ namespace TrpgMaps
                 _panelHost.Bounds = bounds;
                 _panelScroll.Bounds = new Rectangle(0, 0, bounds.Width, bounds.Height);
 
-                using (var region = Theme.RightRoundedRect(
-                    new RectangleF(0, 0, bounds.Width, bounds.Height), 16f))
+                // ⚠️ 只在**尺寸**变了的时候重做圆角 Region。
+                //    改 Region 就是一次 SetWindowRgn —— 窗口要重新裁剪、整个面板（连同
+                //    全部子控件）一起重画。滑入滑出只改 Left、尺寸不变；以前每帧都重设一次，
+                //    15ms 一帧下纯属浪费，而且正是"面板边框先闪一下"的来源之一。
+                if (_panelHost.Size != _regionSize)
                 {
-                    var old = _panelHost.Region;
-                    _panelHost.Region = new Region(region);
-                    if (old != null) old.Dispose();
+                    using (var region = Theme.RightRoundedRect(
+                        new RectangleF(0, 0, bounds.Width, bounds.Height), 16f))
+                    {
+                        var old = _panelHost.Region;
+                        _panelHost.Region = new Region(region);
+                        if (old != null) old.Dispose();
+                    }
+                    _regionSize = _panelHost.Size;
                 }
 
                 _canvas.PanelRect = bounds;
@@ -1102,8 +1503,6 @@ namespace TrpgMaps
             {
                 _canvas.PanelRect = Rectangle.Empty;
             }
-
-            _sidebar.Invalidate();
 
             // 绘图面板浮在右上角，窗口尺寸变了要把它拉回可见范围内
             if (_drawPanel != null && _drawPanelOpen)
@@ -1127,6 +1526,24 @@ namespace TrpgMaps
             base.OnResize(e);
             LayoutChildren();
             ScheduleAnchorBroadcast();
+            // 尺寸一变就排一次补画（见 ForceFullRedraw）：
+            // 整窗合成下"变大后新露出来的那圈"没人给我们标脏，得自己叫一次。
+            ScheduleResizeRepaint();
+        }
+
+        /// <summary>
+        /// 句柄被创建 / 重建时记一笔。
+        ///
+        /// `FormBorderStyle` 从 None 改成 Sizable 再改回来，可能会让窗体**重建窗口句柄**；
+        /// 句柄一重建，`WS_EX_COMPOSITED` 的合成表面、子控件的 z 序、Region 全都要重新来一遍，
+        /// 是"界面某块不刷新"这类问题的头号嫌疑。记下来才能判断到底有没有发生。
+        /// </summary>
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            AppLog.Write("窗口句柄已创建/重建：0x" + Handle.ToInt64().ToString("X") +
+                         "  客户区 " + ClientSize.Width + "x" + ClientSize.Height +
+                         "  全屏=" + _fullscreen);
         }
 
         /// <summary>画布尺寸变了就排一次锚点重播（防抖，见 <see cref="_anchorTimer"/>）。</summary>
@@ -1204,6 +1621,16 @@ namespace TrpgMaps
         {
             _sidebarFrom = _sidebarWidth;
             _sidebarTo = expanded ? SidebarPanel.ExpandedWidth : SidebarPanel.CollapsedWidth;
+
+            if (SuppressPanelAnimation)          // --no-anim：一步到位
+            {
+                _sidebarWidth = _sidebarTo;
+                _sidebar.TextOpacity = expanded ? 1.0 : 0.0;
+                _sidebarAnimating = false;
+                LayoutChildren();
+                return;
+            }
+
             _sidebarAnimStart = Environment.TickCount;
             _sidebarAnimating = true;
             _animTimer.Start();
@@ -1211,6 +1638,18 @@ namespace TrpgMaps
 
         private void StartFadeAnimation(double maskTo, double slideTo)
         {
+            if (SuppressPanelAnimation)          // --no-anim：一步到位
+            {
+                _maskFrom = _maskTo = maskTo;
+                _slideFrom = _slideTo = slideTo;
+                _maskOpacity = maskTo;
+                _panelSlide = slideTo;
+                _canvas.MaskOpacity = maskTo;
+                _fadeAnimating = false;
+                LayoutChildren();
+                return;
+            }
+
             _maskFrom = _maskOpacity;
             _maskTo = maskTo;
             _slideFrom = _panelSlide;
@@ -1455,20 +1894,70 @@ namespace TrpgMaps
             // 滚动容器是自绘的细滑块，画在 16px 内缩里，永远不会压到内容。
             _contentWidth = _panelWidth - PanelInset * 2;
 
-            BuildPanelContent(kind);
+            // 冷路径（第一次建这个面板）才需要先藏起来：重建整棵树时挡一下，
+            // 免得"半新半旧"上屏。热路径是复用缓存、内容只是切显隐，
+            // **不用动 _panelHost 的 Visible** —— 一次"整块面板重新显示"实测要 ~70ms。
+            var cold = !HasUsablePanelCache(kind);
+            if (cold) _panelHost.Visible = false;
+
+            var sw = Stopwatch.StartNew();
+            long m0 = 0, m1, m2, m3, m4, m5;
+
+            var warm = BuildPanelContent(kind);
+            m0 = sw.ElapsedMilliseconds;
 
             _panelOpen = kind;
-            _panelSlide = -24;
+            _panelSlide = SuppressPanelAnimation ? 0 : -24;
             _maskOpacity = 0;
-            _panelHost.Visible = true;
             _canvas.MaskOpacity = 0;
 
+            // 热路径（复用缓存）：数据都在本地了，**先灌完再画** ——
+            // 第一帧就是完整的面板，不再有"框架先出来、内容慢一步补上"。
+            // 冷路径（第一次建这个面板）：数据可能要现算（比如枚举网卡要一秒），
+            // 那就还是等面板摆出来之后再用一次性定时器灌，免得"点下去半天不见东西"。
+            // ⚠️ 网卡面板例外：它冷热都可能撞上"没插网线枚举很慢"，一律走延后那条。
+            var dataMs = -1L;
+            if (warm && kind != PanelKind.Network)
+            {
+                var dataSw = Stopwatch.StartNew();
+                try { FillPanelData(kind); }
+                catch (Exception ex) { AppLog.Write("面板数据填充失败：" + kind, ex); }
+                dataMs = dataSw.ElapsedMilliseconds;
+            }
+            m1 = sw.ElapsedMilliseconds;
+
+            if (!_panelHost.Visible) _panelHost.Visible = true;   // 已显示就是空操作（热路径）
+            m2 = sw.ElapsedMilliseconds;
+
             LayoutChildren();
+            m3 = sw.ElapsedMilliseconds;
+
             _panelScroll.RefreshLayout();
+            m4 = sw.ElapsedMilliseconds;
+
+            // 显示之后、消息循环轮到之前，把这棵控件树**整个同步画完**：
+            // 第一帧就是完整的（不然就会"先出一圈边框、其余地方慢一步刷新"）。
+            // ⚠️ 不要再为了"量一次纯重绘"多画一遍 —— 那一次就是 35ms。
+            PaintTreeNow(_panelHost);
+            m5 = sw.ElapsedMilliseconds;
+
+            AppLog.Write("面板已就绪（" + kind + (warm ? "·热" : "·冷") + "）：建内容 " + m0 +
+                         "ms / 数据 " + (dataMs < 0 ? "延后" : dataMs + "ms") +
+                         " / 显示 " + (m2 - m1) + "ms / 布局 " + (m3 - m2) +
+                         " / 滚layout " + (m4 - m3) + " / 首绘 " + (m5 - m4) +
+                         "ms｜合计 " + m5 + "ms｜子控件 " + CountControls(_panelContent) + " 个");
 
             StartFadeAnimation(1.0, 0.0);
 
-            // 等动画收尾后再灌数据（一次性定时器）
+            // 冷路径：等动画收尾后再灌数据（一次性定时器）
+            if (dataMs >= 0)
+            {
+                // 热路径的数据已经在上面同步灌完了，忙状态在这里就放掉
+                //（冷路径是定时器里的 finally 放，见下面）。
+                _busy = false;
+                return;
+            }
+
             Timer loader = new Timer();
             loader.Interval = 220;
             loader.Tick += delegate
@@ -1477,26 +1966,7 @@ namespace TrpgMaps
                 loader.Dispose();
                 try
                 {
-                    if (_panelOpen != kind) return;   // 期间面板已被关掉，跳过
-
-                    if (kind == PanelKind.Map)
-                    {
-                        RefreshMapList();
-                        ApplyMapToCanvas();
-                    }
-                    else if (kind == PanelKind.Network)
-                    {
-                        RefreshSettings();
-                        RefreshPlayerControls();
-                        StartPolling();
-                    }
-                    // 关于面板没有要刷的数据（网卡、名册、底图列表它都不关心），
-                    // 所以这里什么都不做 —— 别顺手调 RefreshSettings()，
-                    // 那会去枚举网卡，在没插网线的机器上白等一秒。
-                    else
-                    {
-                        RefreshUpdateStatusLine();
-                    }
+                    FillPanelData(kind);
                 }
                 finally
                 {
@@ -1564,6 +2034,9 @@ namespace TrpgMaps
             _urlLabel = null;
             _playerList = null;
             _roomLockButton = null;
+            _roomLabel = null;
+            _roomPassBox = null;
+            _roomSaveButton = null;
             _rotateLabel = null;
             _playersSignature = null;
             _avatarBox = null;
@@ -1571,9 +2044,81 @@ namespace TrpgMaps
 
             if (_panelContent != null)
             {
-                _panelScroll.SetContent(null);   // 移除并释放旧的内容树
+                // 只"藏起来"，**不摘不释放** —— 这棵树在 _panelCache 里存着，
+                // 下次开面板直接复用（摘挂会销毁重建 39 个窗口句柄，实测 70~200ms）。
+                _panelScroll.SetContent(null);
                 _panelContent = null;
             }
+        }
+
+        /// <summary>
+        /// 一个面板"已经建好的内容树" + 里面那些要反复刷新的控件引用。
+        ///
+        /// 为什么要缓存：三种面板的内容树各有 39 个控件，每次打开都重建一遍，
+        /// 实测"显示+布局"要 110~210ms（全是创建窗口句柄）、首次绘制再 40~140ms，
+        /// 合计 300~390ms —— 这就是"打开面板卡一下"的全部来源。
+        /// 复用之后只剩"挂回去 + 重画一次" ≈ 40ms。
+        /// </summary>
+        private sealed class PanelCacheEntry
+        {
+            public Control Content;
+            public object[] Refs;
+            /// <summary>建它的时候用的内容宽度。窗口尺寸变了这份缓存就作废（行的宽度是按它摆的）。</summary>
+            public int ContentWidth;
+        }
+
+        private readonly Dictionary<PanelKind, PanelCacheEntry> _panelCache =
+            new Dictionary<PanelKind, PanelCacheEntry>();
+
+        /// <summary>这个面板有没有**当下就能用**的缓存（存在、且是按当前内容宽度建的）。</summary>
+        private bool HasUsablePanelCache(PanelKind kind)
+        {
+            PanelCacheEntry e;
+            return _panelCache.TryGetValue(kind, out e)
+                && e.Content != null && !e.Content.IsDisposed
+                && e.ContentWidth == _contentWidth;
+        }
+
+        /// <summary>把"刷新时要用的控件引用"打包（缓存面板用）。</summary>
+        private object[] CapturePanelRefs()
+        {
+            return new object[]
+            {
+                _gridTrack, _gridLabel, _fitCombo, _gridColorCombo, _gridColorHint, _uploadStatus,
+                _mapList, _ipCombo, _portBox, _saveButton, _netStatus, _fwLabel, _fwButton,
+                _qrBox, _urlLabel, _playerList, _roomLockButton, _rotateLabel, _playersSignature,
+                _avatarBox, _updateStatus, _roomLabel, _roomPassBox, _roomSaveButton,
+            };
+        }
+
+        /// <summary>还原"刷新时要用的控件引用"（复用缓存面板时必须做，否则刷新会空引用）。</summary>
+        private void RestorePanelRefs(object[] r)
+        {
+            if (r == null) return;
+            _gridTrack = (ModernSlider)r[0];
+            _gridLabel = (Label)r[1];
+            _fitCombo = (ModernDropDown)r[2];
+            _gridColorCombo = (ModernDropDown)r[3];
+            _gridColorHint = (Label)r[4];
+            _uploadStatus = (Label)r[5];
+            _mapList = (ModernList)r[6];
+            _ipCombo = (ModernDropDown)r[7];
+            _portBox = (ModernTextBox)r[8];
+            _saveButton = (Button)r[9];
+            _netStatus = (Label)r[10];
+            _fwLabel = (Label)r[11];
+            _fwButton = (Button)r[12];
+            _qrBox = (PictureBox)r[13];
+            _urlLabel = (Label)r[14];
+            _playerList = (ModernList)r[15];
+            _roomLockButton = (Button)r[16];
+            _rotateLabel = (Label)r[17];
+            _playersSignature = (string)r[18];
+            _avatarBox = (PictureBox)r[19];
+            _updateStatus = (Label)r[20];
+            _roomLabel = (Label)r[21];
+            _roomPassBox = (ModernTextBox)r[22];
+            _roomSaveButton = (Button)r[23];
         }
 
         private static int Clamp(int value, int min, int max)
@@ -1587,11 +2132,36 @@ namespace TrpgMaps
         //  面板内容
         // ============================================================
 
-        private void BuildPanelContent(PanelKind kind)
+        /// <summary>
+        /// 准备某个面板的内容树。
+        /// 返回 `true` = **复用了缓存**（热，这次没建任何控件）；`false` = 这次是新建的（冷）。
+        /// </summary>
+        private bool BuildPanelContent(PanelKind kind)
         {
             ClearPanelReferences();
 
-            _panelContent = new FlowLayoutPanel();
+            // 窗口尺寸变过（全屏↔窗口化、--height 换高度）⇒ 行宽是按旧宽度摆的，作废重建。
+            PanelCacheEntry stale;
+            if (_panelCache.TryGetValue(kind, out stale) && !HasUsablePanelCache(kind))
+            {
+                if (stale.Content != null && !stale.Content.IsDisposed) stale.Content.Dispose();
+                _panelCache.Remove(kind);
+            }
+
+            PanelCacheEntry cached;
+            if (_panelCache.TryGetValue(kind, out cached))
+            {
+                // 热路径：把上次建好的那棵树挂回去就行 —— 不创建控件、不建窗口句柄。
+                RestorePanelRefs(cached.Refs);
+                _panelContent = (FlowLayoutPanel)cached.Content;
+                _panelScroll.SetContent(_panelContent);
+                _panelContent.PerformLayout();
+                _panelScroll.RefreshLayout();
+                HookWheel(_panelContent);
+                return true;
+            }
+
+            _panelContent = new BufferedFlowPanel();   // 双缓冲：一次塞几十行时不闪
             _panelContent.FlowDirection = FlowDirection.TopDown;
             _panelContent.WrapContents = false;
             _panelContent.AutoSize = true;
@@ -1601,13 +2171,67 @@ namespace TrpgMaps
 
             _panelScroll.SetContent(_panelContent);
 
+            // 建行期间挂起布局：不然每 Add 一行就整块重排一次（几十行 = 几十次重排），
+            // 既慢又会让底板反复重画。建完再一次性排。
+            _panelContent.SuspendLayout();
+
             if (kind == PanelKind.Map) BuildMapPanel();
             else if (kind == PanelKind.Network) BuildNetworkPanel();
             else BuildAboutPanel();
 
+            _panelContent.ResumeLayout(false);
             _panelContent.PerformLayout();
             _panelScroll.RefreshLayout();
             HookWheel(_panelContent);
+
+            _panelCache[kind] = new PanelCacheEntry
+            {
+                Content = _panelContent,
+                Refs = CapturePanelRefs(),
+                ContentWidth = _contentWidth,
+            };
+            return false;
+        }
+
+        /// <summary>
+        /// 灌这个面板的**动态数据**（底图列表、网卡、名册、更新状态…）。
+        /// 冷 / 热两条路径都调它，只是时机不同（见 OpenPanel）。
+        /// </summary>
+        private void FillPanelData(PanelKind kind)
+        {
+            if (_panelOpen != kind) return;          // 期间面板已被关掉/切走，跳过
+
+            if (kind == PanelKind.Map)
+            {
+                var swl = Stopwatch.StartNew();
+                RefreshMapList();
+                var tList = swl.ElapsedMilliseconds;
+
+                // ⚠️ 只在"画布和 MapStore 真的不一致"时才重摆底图。
+                // ApplyMapToCanvas 会**重新解码**底图（webp 走自研 VP8 解码器），实测约 170ms ——
+                // 打开地图面板时绝大多数状态根本没变，白解一次就是"卡一下"的主因之一。
+                // 判断条件与 SyncCanvasWithStore 里那条完全一致（同样三件事）。
+                var same = string.Equals(_maps.CurrentMap, _canvasMapName, StringComparison.Ordinal)
+                        && string.Equals(_maps.FitMode, _canvasFitMode, StringComparison.Ordinal)
+                        && _maps.Rotation == _canvasRotation;
+                if (!same) ApplyMapToCanvas();
+                AppLog.Write("  地图面板数据：列表 " + tList + "ms（" +
+                             (_mapList == null ? 0 : _mapList.Items.Count) + " 项）/ 重摆底图 " +
+                             (same ? "跳过" : (swl.ElapsedMilliseconds - tList) + "ms"));
+            }
+            else if (kind == PanelKind.Network)
+            {
+                RefreshSettings();
+                RefreshPlayerControls();
+                StartPolling();
+            }
+            // 关于面板没有要刷的数据（网卡、名册、底图列表它都不关心），
+            // 所以这里什么都不做 —— 别顺手调 RefreshSettings()，
+            // 那会去枚举网卡，在没插网线的机器上白等一秒。
+            else
+            {
+                RefreshUpdateStatusLine();
+            }
         }
 
         // ---------------- 地图设置面板 ----------------
@@ -2189,9 +2813,39 @@ namespace TrpgMaps
 
             AddSeparator();
 
+            // ---------------- 房间 ----------------
+            // 房间号每次启动都会换一个新的（见 Core/Room.cs）。这里显示的必须是
+            // "当前这次运行"的号，所以 RefreshSettings() 每次都从 _settings 现取。
+            AddRow(MakeLabel("房间号（每次启动都会换一个新的）", 9f, Theme.Text), 20);
+            _roomLabel = MakeLabel(_settings.RoomNumber, 15f, Theme.Link);
+            AddRow(_roomLabel, 30);
+
+            AddRow(MakeLabel("房间密码（留空 = 不需要密码）", 9f, Theme.Text), 20);
+            _roomPassBox = new ModernTextBox();
+            _roomPassBox.MaxLength = RoomState.MaxPasswordLength;
+            _roomPassBox.Text = _settings.Room.Password;
+            _roomPassBox.Input.KeyPress += delegate (object s, KeyPressEventArgs e)
+            {
+                // 密码会出现在玩家地址的 query 里，别让人误输入空格 / 制表符把地址弄坏
+                if (e.KeyChar == ' ' || e.KeyChar == '\t' || e.KeyChar == '\r' || e.KeyChar == '\n')
+                {
+                    e.Handled = true;
+                }
+            };
+            AddRow(_roomPassBox, 30);
+
+            _roomSaveButton = MakeButton("保存密码并刷新地址", true, false);
+            _roomSaveButton.Click += delegate { SaveRoomPassword(); };
+            AddRow(_roomSaveButton, 34);
+
+            AddSeparator();
+
             AddRow(MakeLabel("玩家地址", 11f, Color.White), 26);
-            _urlLabel = MakeLabel(_settings.PlayerUrl, 9f, Theme.Link);
-            AddRow(_urlLabel, 22);
+            _urlLabel = MakeLabel(_settings.PlayerUrl, 8.5f, Theme.Link);
+            // 三行位置：带密码的地址一行放不下，RefreshUrlLabel() 会拆成
+            // "主机:端口 / 房间路径 / 密码" 三行（见 UpdatePlayerUrlLabel）。
+            AddRow(_urlLabel, 46);
+            UpdatePlayerUrlLabel();
 
             _qrBox = new PictureBox();
             _qrBox.BackColor = Theme.Panel;
@@ -2203,7 +2857,7 @@ namespace TrpgMaps
             qrRow.Controls.Add(_qrBox);
             _panelContent.Controls.Add(qrRow);
 
-            var qrHint = MakeLabel("手机扫码即可加入", 8f, Theme.TextDim);
+            var qrHint = MakeLabel("手机扫码即可加入（地址里带着房间号和密码）", 8f, Theme.TextDim);
             qrHint.TextAlign = ContentAlignment.MiddleCenter;
             AddRow(qrHint, 20);
 
@@ -2267,9 +2921,155 @@ namespace TrpgMaps
         {
             RefreshAddresses(force: true);
             if (_portBox != null) _portBox.Text = _settings.Port.ToString();
-            if (_urlLabel != null) _urlLabel.Text = _settings.PlayerUrl;
+            if (_roomLabel != null) _roomLabel.Text = _settings.RoomNumber;
+            if (_roomPassBox != null) _roomPassBox.Text = _settings.Room.Password;
+            UpdatePlayerUrlLabel();
             UpdateRoomLockButton();
             RefreshQrImage();
+        }
+
+        /// <summary>
+        /// 刷新"玩家地址"那一行。
+        ///
+        /// ⚠️ 面板只有 320 像素宽，而这个地址带着"房间号 + 密码"，**一行根本放不下**
+        /// （实测 `http://10.244.148.193:5000/…/player?passwd=pw123` 到 `/playe` 就被截掉了）。
+        /// 所以拆成三行：**主机:端口 / 房间路径 / 密码**，分行处都是天然断点，读起来也清楚。
+        /// （二维码里带的是**完整地址**，这一行只是给人看的。）
+        /// </summary>
+        private void UpdatePlayerUrlLabel()
+        {
+            if (_urlLabel == null) return;
+
+            var url = _settings.PlayerUrl;
+            const string scheme = "http://";
+            if (url.StartsWith(scheme, StringComparison.OrdinalIgnoreCase))
+                url = url.Substring(scheme.Length);      // 去掉协议头能省 7 个字符
+
+            // 先按第一个 '/' 拆出 "主机:端口" 与 "/房间号/player?passwd=…"
+            var slash = url.IndexOf('/');
+            var lines = new List<string>();
+            if (slash <= 0)
+            {
+                lines.Add(url);
+            }
+            else
+            {
+                lines.Add(url.Substring(0, slash));      // 主机:端口
+                var rest = url.Substring(slash);
+                var query = rest.IndexOf("?passwd=", StringComparison.Ordinal);
+                if (query < 0)
+                {
+                    lines.Add(rest);
+                }
+                else
+                {
+                    lines.Add(rest.Substring(0, query));         // /房间号/player
+                    lines.Add(rest.Substring(query));            // ?passwd=密码
+                }
+            }
+
+            _urlLabel.Text = string.Join("\n", lines.ToArray());
+        }
+
+        /// <summary>
+        /// 保存房间密码（空 = 取消密码），并把地址 / 二维码刷新一遍。
+        ///
+        /// 地址里带着密码（<c>?passwd=</c>），所以密码一变，DM 这边显示的地址和二维码
+        /// 都要跟着变 —— 玩家扫码进来自动带上新密码，不用手打。
+        /// </summary>
+        private void SaveRoomPassword()
+        {
+            if (_roomPassBox == null) return;
+
+            var effective = _settings.SetRoomPassword(_roomPassBox.Text);
+            _roomPassBox.Text = effective;
+            UpdatePlayerUrlLabel();
+            RefreshQrImage();
+
+            SetNetStatus(effective.Length == 0
+                ? "已清除房间密码（任何人都能加入）"
+                : "房间密码已设置（" + effective.Length + " 个字符）", false);
+
+            // 已经在房里的玩家页面也要知道"现在开始要密码了"
+            _routes.BroadcastRoomState();
+        }
+
+        // ============================================================
+        //  顶部胶囊提示（"xxx 离开了房间"）
+        // ============================================================
+
+        private const int ToastHiddenY = -42;   // 藏起来时胶囊在哪（窗口上边之外）
+        private const int ToastRestY = 12;      // 停住时离窗口上边多远
+        private const int ToastSlideMs = 180;   // 下滑 / 缩回各用多久
+        private const int ToastHoldMs = 2000;   // 停在上面多久（需求写的就是 2 秒）
+
+        /// <summary>
+        /// 有玩家退出了房间：窗口顶部正中出现一条胶囊提示，2 秒后缩回。
+        ///
+        /// ⚠️ 这条回调是从 **HTTP 线程**（`/api/leave` 的处理线程）进来的，
+        /// 所以先切回 UI 线程再碰任何控件。
+        /// </summary>
+        private void ShowPlayerLeftToast(string name)
+        {
+            if (IsDisposed) return;
+
+            if (InvokeRequired)
+            {
+                try { BeginInvoke(new Action<string>(ShowPlayerLeftToast), new object[] { name }); }
+                catch (Exception) { /* 窗口正在关闭，忽略 */ }
+                return;
+            }
+
+            _toastText = (name ?? string.Empty) + " 离开了房间";
+            _toastPhase = 0;
+            _toastPhaseStart = Environment.TickCount;
+            if (_canvas != null) _canvas.SetToast(_toastText, ToastHiddenY);
+            _toastTimer.Start();
+            AppLog.Write("界面提示：" + _toastText);
+        }
+
+        /// <summary>推进胶囊提示的动画：0 = 下滑，1 = 停留，2 = 缩回。</summary>
+        private void ToastTick()
+        {
+            if (_canvas == null || _canvas.IsDisposed)
+            {
+                _toastTimer.Stop();
+                return;
+            }
+
+            var elapsed = Environment.TickCount - _toastPhaseStart;
+
+            if (_toastPhase == 0)
+            {
+                var t = Math.Min(1.0, elapsed / (double)ToastSlideMs);
+                // 缓出：开头快、收尾轻，看着像"从上面掉下来"
+                var eased = 1 - (1 - t) * (1 - t);
+                _canvas.SetToast(_toastText,
+                    (int)Math.Round(ToastHiddenY + (ToastRestY - ToastHiddenY) * eased));
+                if (t >= 1.0)
+                {
+                    _toastPhase = 1;
+                    _toastPhaseStart = Environment.TickCount;
+                }
+                return;
+            }
+
+            if (_toastPhase == 1)
+            {
+                if (elapsed < ToastHoldMs) return;
+                _toastPhase = 2;
+                _toastPhaseStart = Environment.TickCount;
+                return;
+            }
+
+            var back = Math.Min(1.0, elapsed / (double)ToastSlideMs);
+            _canvas.SetToast(_toastText,
+                (int)Math.Round(ToastRestY - (ToastRestY - ToastHiddenY) * back));
+            if (back >= 1.0)
+            {
+                _toastTimer.Stop();
+                _canvas.SetToast(string.Empty, ToastHiddenY);
+            }
         }
 
         private void UpdateRoomLockButton()
@@ -2380,6 +3180,11 @@ namespace TrpgMaps
                 return;
             }
 
+            // 改之前那一套：新端口要是起不来，得**回滚** —— 否则设置里是新地址、
+            // 真正在服务的还是旧地址，界面 / 地址栏 / 二维码会互相打架。
+            var previousIp = _settings.ListenIp;
+            var previousPort = _settings.Port;
+
             var changed = !string.Equals(ip, _settings.ListenIp, StringComparison.OrdinalIgnoreCase)
                           || port != _settings.Port;
 
@@ -2410,7 +3215,24 @@ namespace TrpgMaps
                 catch (Exception ex)
                 {
                     AppLog.Write("重开服务失败", ex);
-                    SetNetStatus("新地址未能就绪（端口可能被占用）：" + ex.Message, true);
+                    string reason;
+                    if (!PortPicker.IsPortBlocked(ex, out reason)) reason = ex.Message;
+
+                    // 手动指定的端口失败**不自动换**（用户要的就是这个号），但要把话说准：
+                    // 10013（系统保留）和 10048（被占用）是两回事，前者杀进程也没用。
+                    string ignored;
+                    _settings.TryUpdate(previousIp, previousPort, out ignored);
+                    try
+                    {
+                        _server.Start(previousPort);
+                        SetNetStatus("新端口没起来（" + reason + "），已退回 " +
+                                     previousIp + ":" + previousPort, true);
+                    }
+                    catch (Exception ex2)
+                    {
+                        AppLog.Write("退回原端口也失败", ex2);
+                        SetNetStatus("新端口起不来（" + reason + "），原端口也回不去了", true);
+                    }
                 }
                 finally
                 {
@@ -2425,6 +3247,64 @@ namespace TrpgMaps
             if (_urlLabel != null) _urlLabel.Text = _settings.PlayerUrl;
             _qrCacheKey = null;
             RefreshQrImage();
+        }
+
+        /// <summary>
+        /// 起内置服务：默认端口绑不上就**顺着往后找一个能用的**（见 <see cref="PortPicker"/>）。
+        ///
+        /// 为什么要自动换：Windows 会把一整段端口**预留**给 Hyper-V / WSL / Docker，绑定时报
+        /// `WSAEACCES`（"以一种访问权限不允许的方式做了一个访问套接字的尝试"）—— 那种"占用"
+        /// **没有占用者可以关掉**，用户只是双击了一下程序，不该被这种提示挡在门外。
+        /// 换个号起来、把新地址说清楚就够了（地址 / 二维码都读 `_settings.Port`，会自动跟着变）。
+        /// </summary>
+        private void StartWebServer()
+        {
+            var wanted = _settings.Port;
+            Exception last = null;
+
+            foreach (var candidate in PortPicker.Candidates(wanted))
+            {
+                try
+                {
+                    _server.Start(candidate);
+                }
+                catch (Exception ex)
+                {
+                    last = ex;
+                    continue;
+                }
+
+                // 绑上了：把"实际端口"记回设置里 —— 玩家地址、二维码、换址跳转都读它。
+                _settings.SetPort(candidate);
+                if (candidate != wanted)
+                {
+                    var reason = "未知原因";
+                    string hint;
+                    if (last != null && PortPicker.IsPortBlocked(last, out hint)) reason = hint;
+                    else if (last != null) reason = last.Message;
+                    AppLog.Write("端口 " + wanted + " 绑不上（" + reason + "），已改用 " + candidate);
+                    SetNetStatus("端口 " + wanted + " 不可用，已自动改用 " + candidate, true);
+                    if (!Headless)
+                    {
+                        MessageBox.Show(this,
+                            "默认端口 " + wanted + " 用不了：" + reason + "\r\n\r\n" +
+                            "已自动改用端口 " + candidate + "，玩家地址见「网络」面板。",
+                            "TrpgMaps", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    }
+                }
+                AppLog.Write("Web 服务器已启动：" + _settings.PlayerUrl);
+                return;
+            }
+
+            // 顺延 + 随机全试完还是不行 —— 这已经不是"端口冲突"能解释的了。
+            AppLog.Write("启动 Web 服务器失败（从 " + wanted + " 起试了 " +
+                         (PortPicker.SequentialTries + PortPicker.RandomTries) + " 个候选端口）", last);
+            if (!Headless)
+            {
+                MessageBox.Show(this,
+                    "内置服务器启动失败：找不到可用端口。\r\n" + (last == null ? "" : last.Message),
+                    "TrpgMaps", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
         }
 
         private void SetNetStatus(string text, bool error)
@@ -2911,7 +3791,7 @@ namespace TrpgMaps
         /// <summary>统一的"一行"容器（横向排列、不换行、宽度受面板宽度约束）。</summary>
         private FlowLayoutPanel MakeRowPanel(Padding margin)
         {
-            var row = new FlowLayoutPanel();
+            var row = new BufferedFlowPanel();          // 双缓冲，见 BufferedFlowPanel
             row.FlowDirection = FlowDirection.LeftToRight;
             row.WrapContents = false;
             row.AutoSize = true;

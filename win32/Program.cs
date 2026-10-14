@@ -22,7 +22,11 @@ namespace TrpgMaps
             //                        模式：all / base / sidebar / map / mapcollapsed /
             //                              grid35 / closeall / gridreopen / net / about /
             //                              rotate90 / gridcolor / draw / drawbrush / drawcone /
-            //                              drawbrushloose / drawtangent
+            //                              drawbrushloose / drawtangent / fs / toast
+            //                        fs = 全屏往返自检，<路径> 是目录：出 `fs-a.png`（强制补画过的
+            //                             正确基准）和 `fs-b.png`（退出全屏再重新全屏之后那张），
+            //                             两张逐像素一比就知道"窗口变大后新露出的区域刷没刷"
+            //                        toast = 顶部胶囊提示（"xxx 离开了房间"）停住的样子
             //                        模式传 all 时 <路径> 是输出目录，一个进程截完所有画面
             //   --no-server         不起内置 Web 服务器（--ui 已默认带上）
             //   --selfcheck [目录]  无人值守自检：离屏渲染 + 打印几何，**完全不开窗口**
@@ -40,6 +44,12 @@ namespace TrpgMaps
             //                       需要管理员权限，会自己弹 UAC 重开。
             //   --check-update      只在命令行里查一次更新，结果写进 app.log 并用退出码表达：
             //                       0 = 有新版本，1 = 已是最新，2 = 检查失败。不弹任何窗口。
+            //   --no-composited     关掉"整窗合成"（WS_EX_COMPOSITED）。
+            //                       默认开着：面板是"底板 + 一堆子控件"拼的，子控件各自排队
+            //                       重画，会出现"先出边框、其余慢一步"。老机器 / 显卡驱动
+            //                       异常时可以用它对比排查。
+            //   --no-anim           面板与侧栏**不做滑入淡出动画**，一步到位。
+            //                       老机器上想再稳一点就用它。
             //
             // 为什么自检模式默认不起服务器：起服务要监听局域网地址，会弹 Windows 防火墙
             // 的"是否允许通信"授权框；无人值守时没人点它，框就一直挂在屏幕上挡住流程。
@@ -62,6 +72,8 @@ namespace TrpgMaps
             var noPrompts = false;
             var repairRegistry = false;
             var checkUpdate = false;
+            var noComposited = false;
+            var noAnim = false;
 
             if (args != null)
             {
@@ -126,6 +138,14 @@ namespace TrpgMaps
                     {
                         checkUpdate = true;
                     }
+                    else if (string.Equals(arg, "--no-composited", StringComparison.OrdinalIgnoreCase))
+                    {
+                        noComposited = true;
+                    }
+                    else if (string.Equals(arg, "--no-anim", StringComparison.OrdinalIgnoreCase))
+                    {
+                        noAnim = true;
+                    }
                 }
             }
 
@@ -172,6 +192,10 @@ namespace TrpgMaps
 
             try
             {
+                // 窗口级的绘制开关必须在**建窗口之前**设好（CreateParams 只在建句柄时问一次）。
+                MainForm.SuppressComposited = noComposited;
+                MainForm.SuppressPanelAnimation = noAnim;
+
                 // 高度必须在构造期传进去：窗口 Bounds 是构造函数里定的，
                 // new 完再赋值就晚了（见 MainForm 的双参构造）。
                 var form = new MainForm(windowed, windowHeight);
