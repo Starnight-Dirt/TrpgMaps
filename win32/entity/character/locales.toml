@@ -1,0 +1,11 @@
+# TrpgMaps 素材文件夹显示名 / Folder display name
+# 填好后，素材列表里会用这里的名字代替文件夹本名；留空 = 用文件夹本名。
+# Leave a value empty to use the folder name itself.
+# 段名是 BCP 47 语言标签，当前界面语言没有对应值时回退到文件夹名。
+
+[zh-cn]
+foldername = ""
+
+[en-us]
+foldername = ""
+

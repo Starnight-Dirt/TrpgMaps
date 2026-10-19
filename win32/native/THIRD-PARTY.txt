@@ -1,0 +1,56 @@
+TrpgAudio.dll - third-party components
+======================================
+
+TrpgAudio.dll is built by this project from `audio_bridge.c` (our own glue
+code) plus the two libraries below. Both are permissive enough to be
+redistributed inside an MIT-licensed project - that is the whole reason they
+were chosen.
+
+----------------------------------------------------------------------------
+1. miniaudio  v0.11.25
+----------------------------------------------------------------------------
+   Home    : https://github.com/mackron/miniaudio
+   Source  : native\miniaudio.h  (single header, 4.1 MB)
+   License : public domain (Unlicense) OR MIT No Attribution (MIT-0),
+             at your option - see "License" at the end of miniaudio.h.
+
+   Provides: device output (WASAPI / DirectSound / WinMM backends),
+             and the built-in decoders for WAV, MP3 and FLAC.
+
+----------------------------------------------------------------------------
+2. stb_vorbis  v1.22
+----------------------------------------------------------------------------
+   Home    : https://github.com/nothings/stb
+   Source  : native\stb_vorbis.c  (single file, 193 KB)
+   License : public domain, or MIT (dual) - see the header of stb_vorbis.c.
+
+   Provides: the Ogg Vorbis decoder. miniaudio does NOT embed one - it only
+             enables MA_HAS_VORBIS when it sees STB_VORBIS_INCLUDE_STB_VORBIS_H,
+             so stb_vorbis.c has to be compiled in alongside it.
+
+----------------------------------------------------------------------------
+Why not a bigger audio library?
+----------------------------------------------------------------------------
+   BASS (un4seen) was the obvious candidate - small, fast, wide format
+   support. It is free for non-commercial use only, so shipping it inside a
+   project that may be released under MIT would be a licensing conflict.
+   FMOD has similar restrictions. miniaudio + stb_vorbis cover the formats
+   that matter here (WAV / MP3 / FLAC / OGG) under licenses that impose no
+   such restriction.
+
+   AAC / M4A are NOT supported: miniaudio has no AAC decoder, and adding one
+   would mean another dependency. Those files are still listed by the music
+   panel, but opening one reports "unsupported format" instead of failing
+   silently.
+
+----------------------------------------------------------------------------
+Rebuilding
+----------------------------------------------------------------------------
+   powershell -ExecutionPolicy Bypass -File scripts\build_audio_dll.ps1 -Rebuild
+
+   Needs MSVC (any edition, x86 cross compiler) + a Windows SDK. The script
+   sets INCLUDE/LIB itself and does not call vcvars*.bat (those shell out to
+   reg.exe, which some locked-down machines block).
+
+   Both source files are kept next to this file so the DLL can be rebuilt
+   from scratch offline.

@@ -124,15 +124,17 @@ namespace TrpgMaps
 
         public static string FormatFeet(double feet)
         {
-            return feet.ToString("0.#", CultureInfo.InvariantCulture) + " 尺";
+            // 单位也要跟界面语言走：中文「5 尺」，英文「5 ft」
+            return Loc.T("unit.feet", feet.ToString("0.#", CultureInfo.InvariantCulture));
         }
 
         /// <summary>把半格数换算成"几格几尺"，状态行上显示用。</summary>
         public static string DescribeDistance(double feet)
         {
             var cells = feet / FeetPerCell;
-            if (Math.Abs(feet) < 0.01) return "0 尺";
-            return FormatFeet(feet) + "（" + cells.ToString("0.##", CultureInfo.InvariantCulture) + " 格）";
+            if (Math.Abs(feet) < 0.01) return FormatFeet(0);
+            return Loc.T("unit.feet.cells", FormatFeet(feet),
+                cells.ToString("0.##", CultureInfo.InvariantCulture));
         }
 
         /// <summary>某个半格点上，横向/纵向到锚点距离在半径内的全部候选点。</summary>
@@ -453,21 +455,21 @@ namespace TrpgMaps
             return Math.Abs(diff);
         }
 
-        /// <summary>形状的中文名。</summary>
+        /// <summary>形状的显示名（跟随界面语言）。</summary>
         public static string ShapeLabel(BrushShape shape)
         {
             switch (shape)
             {
-                case BrushShape.Line: return "线形";
-                case BrushShape.Cone: return "锥形/扇形";
-                case BrushShape.Cube: return "立方";
-                default: return "球形/圆形";
+                case BrushShape.Line: return Loc.T("draw.line");
+                case BrushShape.Cone: return Loc.T("draw.cone");
+                case BrushShape.Cube: return Loc.T("draw.cube");
+                default: return Loc.T("draw.sphere");
             }
         }
 
         public static string ModeLabel(BrushMode mode)
         {
-            return mode == BrushMode.Manual ? "手动" : "笔刷";
+            return mode == BrushMode.Manual ? Loc.T("draw.manual") : Loc.T("draw.brush");
         }
     }
 

@@ -534,7 +534,8 @@ namespace TrpgMaps
                 return false;
             }
 
-            var duplicate = result.Message.Contains("已存在") || result.Message.Contains("重复");
+            // 用 Code 判断，不要比 Message 的文字 —— 那句话现在跟着界面语言变。
+            var duplicate = result.Code == "exists" || result.Code == "duplicate";
             ctx.WriteText(duplicate ? 409 : 400,
                 MiniJson.WriteObject("success", false, "message", result.Message));
             return false;

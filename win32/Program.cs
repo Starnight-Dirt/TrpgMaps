@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
@@ -21,8 +21,8 @@ namespace TrpgMaps
             //   --ui <模式> <路径>   摆好界面 → 渲染成 PNG → 退出（无人值守界面自检）
             //                        模式：all / base / sidebar / map / mapcollapsed /
             //                              grid35 / closeall / gridreopen / net / about /
-            //                              rotate90 / gridcolor / draw / drawbrush / drawcone /
-            //                              drawbrushloose / drawtangent / fs / toast
+            //                              rotate90 / gridcolor / draw / drawentity / drawbrush /
+            //                              drawcone / drawbrushloose / drawtangent / fs / toast
             //                        fs = 全屏往返自检，<路径> 是目录：出 `fs-a.png`（强制补画过的
             //                             正确基准）和 `fs-b.png`（退出全屏再重新全屏之后那张），
             //                             两张逐像素一比就知道"窗口变大后新露出的区域刷没刷"
@@ -49,7 +49,8 @@ namespace TrpgMaps
             //                       重画，会出现"先出边框、其余慢一步"。老机器 / 显卡驱动
             //                       异常时可以用它对比排查。
             //   --no-anim           面板与侧栏**不做滑入淡出动画**，一步到位。
-            //                       老机器上想再稳一点就用它。
+            //                       老机器上再稳一点就用它。
+            //   --write-locales     把词表里新增的键补进 locales\*.json 后退出（发布前跑）。
             //
             // 为什么自检模式默认不起服务器：起服务要监听局域网地址，会弹 Windows 防火墙
             // 的"是否允许通信"授权框；无人值守时没人点它，框就一直挂在屏幕上挡住流程。
@@ -74,6 +75,8 @@ namespace TrpgMaps
             var checkUpdate = false;
             var noComposited = false;
             var noAnim = false;
+            string dumpWebpIn = null;
+            string dumpWebpOut = null;
 
             if (args != null)
             {
@@ -92,6 +95,14 @@ namespace TrpgMaps
                         shotPath = args[i + 2];
                         windowed = true;      // 截图必须在普通窗口下做
                         noServer = true;      // 纯界面自检不需要服务器
+                        i += 2;
+                    }
+                    else if (string.Equals(arg, "--dump-webp", StringComparison.OrdinalIgnoreCase) && i + 2 < args.Length)
+                    {
+                        // 排错用：把自研解码器解出来的东西原样存成 PNG，
+                        // 好跟 libwebp 的结果逐像素比。不参与正常流程。
+                        dumpWebpIn = args[i + 1];
+                        dumpWebpOut = args[i + 2];
                         i += 2;
                     }
                     else if (string.Equals(arg, "--selfcheck", StringComparison.OrdinalIgnoreCase))
@@ -146,6 +157,14 @@ namespace TrpgMaps
                     {
                         noAnim = true;
                     }
+                    else if (string.Equals(arg, "--write-locales", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // 维护用：把内置词表里**新增的键**补进 locales\*.json，然后立刻退出。
+                        // 词表是唯一出处，发布前跑一次就不会出现"代码里加了键、文件里没有"。
+                        Loc.Initialize();
+                        AppLog.Write("语言文件已补齐：" + Loc.LocalesFolder);
+                        return;
+                    }
                 }
             }
 
@@ -174,6 +193,12 @@ namespace TrpgMaps
 
             // 无人值守自检：离屏渲染 + 打印几何，不创建窗口、不走消息循环，
             // 因此不可能弹出任何"是否允许运行/是否允许通信"的对话框。
+            if (dumpWebpIn != null)
+            {
+                Environment.ExitCode = DumpWebp.Run(dumpWebpIn, dumpWebpOut);
+                return;
+            }
+
             if (selfCheck)
             {
                 Environment.ExitCode = SelfCheck.Run(selfCheckDir);
@@ -192,6 +217,10 @@ namespace TrpgMaps
 
             try
             {
+                // 界面语言必须先初始化：下面 MainForm 构造函数里就要取侧栏文字。
+                // 它顺带会把 locales\zh-cn.json / en-us.json 补齐（缺文件时自动生成）。
+                Loc.Initialize();
+
                 // 窗口级的绘制开关必须在**建窗口之前**设好（CreateParams 只在建句柄时问一次）。
                 MainForm.SuppressComposited = noComposited;
                 MainForm.SuppressPanelAnimation = noAnim;
@@ -208,7 +237,7 @@ namespace TrpgMaps
             catch (Exception ex)
             {
                 AppLog.Write("启动失败", ex);
-                MessageBox.Show("程序启动失败：\r\n" + ex.Message, "TrpgMaps",
+                MessageBox.Show(Loc.T("app.start.fail", ex.Message), "TrpgMaps",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
@@ -240,13 +269,13 @@ namespace TrpgMaps
                 {
                     // 用户在 UAC 弹窗上点了"否"
                     AppLog.Write("防火墙修复：用户取消了管理员授权，规则未改动。");
-                    if (!quiet) ShowFirewallResult(false, "已取消管理员授权，防火墙规则没有改动。");
+                    if (!quiet) ShowFirewallResult(false, Loc.T("fw.cancelled"));
                     return 1;
                 }
                 catch (Exception ex)
                 {
                     AppLog.Write("防火墙修复：无法启动管理员进程", ex);
-                    if (!quiet) ShowFirewallResult(false, "无法启动管理员进程：" + ex.Message);
+                    if (!quiet) ShowFirewallResult(false, Loc.T("fw.elevate.fail", ex.Message));
                     return 1;
                 }
             }
@@ -258,8 +287,8 @@ namespace TrpgMaps
             if (!quiet)
             {
                 ShowFirewallResult(ok, ok
-                    ? "防火墙已放行，手机 / 平板现在可以打开玩家页面了。"
-                    : "修复没有成功，详情见程序目录下的 app.log。");
+                    ? Loc.T("fw.repair.ok")
+                    : Loc.T("fw.repair.fail"));
             }
 
             return ok ? 0 : 1;
@@ -267,7 +296,7 @@ namespace TrpgMaps
 
         private static void ShowFirewallResult(bool ok, string message)
         {
-            MessageBox.Show(message, "TrpgMaps - 防火墙", MessageBoxButtons.OK,
+            MessageBox.Show(message, Loc.T("fw.title"), MessageBoxButtons.OK,
                 ok ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
         }
 
@@ -303,7 +332,7 @@ namespace TrpgMaps
                     AppLog.Write("注册信息修复：用户取消了管理员授权。");
                     if (!quiet)
                     {
-                        MessageBox.Show("已取消管理员授权，注册信息没有改动。", "TrpgMaps",
+                        MessageBox.Show(Loc.T("reg.cancelled"), "TrpgMaps",
                             MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     }
                     return 1;
@@ -311,7 +340,7 @@ namespace TrpgMaps
                 catch (Exception ex)
                 {
                     AppLog.Write("注册信息修复：无法启动管理员进程", ex);
-                    if (!quiet) MessageBox.Show("无法启动管理员进程：" + ex.Message, "TrpgMaps");
+                    if (!quiet) MessageBox.Show(Loc.T("fw.elevate.fail", ex.Message), "TrpgMaps");
                     return 1;
                 }
             }
@@ -333,8 +362,7 @@ namespace TrpgMaps
 
                 if (!quiet)
                 {
-                    MessageBox.Show("注册信息已刷新。\r\n\r\n安装位置：" + AppEnv.Root +
-                                    "\r\n版本：" + AppInfo.VersionText, "TrpgMaps",
+                    MessageBox.Show(Loc.T("reg.done", AppEnv.Root, AppInfo.VersionText), "TrpgMaps",
                         MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
                 return 0;
@@ -342,7 +370,7 @@ namespace TrpgMaps
             catch (Exception ex)
             {
                 AppLog.Write("注册信息修复失败", ex);
-                if (!quiet) MessageBox.Show("修复失败：" + ex.Message, "TrpgMaps");
+                if (!quiet) MessageBox.Show(Loc.T("reg.fail", ex.Message), "TrpgMaps");
                 return 1;
             }
         }

@@ -95,6 +95,7 @@
 
   <ItemGroup>
     <Compile Include="Program.cs" />
+    <Compile Include="DumpWebp.cs" />
     <Compile Include="Theme.cs" />
     <Compile Include="Widgets.cs" />
     <Compile Include="MainForm.cs" />
@@ -103,6 +104,7 @@
     <Compile Include="DrawOverlay.cs" />
     <Compile Include="SidebarPanel.cs" />
     <Compile Include="UpdateDialog.cs" />
+    <Compile Include="ConfirmDialog.cs" />
     <Compile Include="SelfCheck.cs" />
     <Compile Include="Core\AppInfo.cs" />
     <Compile Include="Core\AppEnv.cs" />
@@ -123,6 +125,11 @@
     <Compile Include="Core\GameState.cs" />
     <Compile Include="Core\Room.cs" />
     <Compile Include="Core\PortPicker.cs" />
+    <Compile Include="Core\I18n.cs" />
+    <Compile Include="Core\FolderLocale.cs" />
+    <Compile Include="Core\AudioEngine.cs" />
+    <Compile Include="Core\AudioLibrary.cs" />
+    <Compile Include="Core\Lrc.cs" />
     <Compile Include="Core\RealtimeHub.cs" />
     <Compile Include="Core\MiniJson.cs" />
     <Compile Include="Core\HttpServer.cs" />
@@ -151,6 +158,26 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <!--
+      自带原声带（OGG / Vorbis，约 15 MB / 8 首）。
+      母带是 48k 立体声 FLAC（约 144 MB），**不进任何安装包**：
+        · 母带放在工作区的 audio-master\（不在本工程里，不会被编译）；
+        · 用 scripts\encode_audio.py 转成这里的 ogg（-q:a 2，约 90 kbps）；
+        · 发布时 make_release.ps1 把母带打包进 open\audio-flac\ 供二次创作。
+      以前这里没有 audio\\**，所以用户自己的音乐不会被打包；现在这一条是**自带曲目**，
+      与"用户自己往 audio\ 里放歌"共存 —— 同目录，运行时一视同仁。
+    -->
+    <Content Include="audio\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <!--
+      界面语言词表：locales\zh-cn.json / en-us.json。
+      文件在运行期也可以自动生成（缺了就补），但打包时必须有 ——
+      装机目录若不可写，没有这两份文件就只剩内置默认词表了。
+    -->
+    <Content Include="locales\**\*.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <!--
       窗口图标源文件。exe 的资源段里已经有图标（ApplicationIcon），
       但 .NET 的 Icon.ExtractAssociatedIcon 只拿得到 32x32 那一张；
       把 .ico 也拷一份到 exe 同级，运行期就能 new Icon(path, 256, 256) 取大图，
@@ -171,6 +198,20 @@
 
   <ItemGroup>
     <None Include="App.net35.config" />
+  </ItemGroup>
+
+  <!--
+    音乐播放器的原生层（自研 audio_bridge.c + miniaudio + stb_vorbis 编成的 DLL）。
+    必须落在 exe 同目录：P/Invoke 是按名字找的（"TrpgAudio.dll"）。
+    ⚠️ 这是本工程唯一一个**运行期非托管 DLL**，是有意的例外 —— 系统 API 放不了
+    FLAC / OGG（MCI 只认 MP3/WAV），而它的许可（公共领域 / MIT-0）允许跟着
+    MIT 项目一起分发。DLL 缺失时程序照常跑，只是音频面板显示"功能不可用"。
+  -->
+  <ItemGroup>
+    <None Include="native\bin\x86\TrpgAudio.dll">
+      <Link>TrpgAudio.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 
   <!--

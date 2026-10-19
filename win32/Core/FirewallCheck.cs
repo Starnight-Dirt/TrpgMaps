@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -92,7 +92,7 @@ namespace TrpgMaps
                 {
                     if (key == null)
                     {
-                        report.Error = "打不开防火墙规则表";
+                        report.Error = Loc.T("fw.error.registry");
                         return report;
                     }
 
@@ -306,19 +306,19 @@ namespace TrpgMaps
                 {
                     process.WaitForExit();
                     if (process.ExitCode == 0) return true;
-                    message = "修复没有成功（退出码 " + process.ExitCode + "），详情见 app.log。";
+                    message = Loc.T("fw.repair.exit", process.ExitCode);
                     return false;
                 }
             }
             catch (Win32Exception)
             {
                 // UAC 被点了"否"
-                message = "已取消管理员授权，防火墙规则没有改动。";
+                message = Loc.T("fw.cancelled");
                 return false;
             }
             catch (Exception ex)
             {
-                message = "无法启动管理员进程：" + ex.Message;
+                message = Loc.T("fw.elevate.fail", ex.Message);
                 return false;
             }
         }

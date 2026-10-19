@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -145,7 +145,7 @@ namespace TrpgMaps
                     var manifest = UpdateManifest.Parse(text);
                     if (manifest == null)
                     {
-                        errors.Add(source.Key + ": 清单格式不对");
+                        errors.Add(Loc.T("update.error.bad.manifest", source.Key));
                         continue;
                     }
 
@@ -159,7 +159,9 @@ namespace TrpgMaps
                 }
             }
 
-            result.Error = errors.Count == 0 ? "没有可用的更新源。" : string.Join("；", errors.ToArray());
+            result.Error = errors.Count == 0
+                ? Loc.T("update.error.no.source")
+                : string.Join("; ", errors.ToArray());
             return result;
         }
 
@@ -275,7 +277,7 @@ namespace TrpgMaps
                 var updater = FindUpdater(stage);
                 if (updater == null)
                 {
-                    error = "升级包里没有找到升级程序 TrpgMapsUpdater.exe，已中止（请到发布页手动下载安装包）。";
+                    error = Loc.T("update.error.no.updater");
                     return false;
                 }
 
@@ -289,7 +291,7 @@ namespace TrpgMaps
             }
             catch (Exception ex)
             {
-                error = "准备升级失败：" + ex.Message;
+                error = Loc.T("update.error.stage", ex.Message);
                 AppLog.Write("准备升级失败", ex);
                 return false;
             }

@@ -1,10 +1,11 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Windows.Forms;
 
 namespace TrpgMaps
@@ -64,10 +65,16 @@ namespace TrpgMaps
 
         private static string GridLabelText(double cm)
         {
-            return "网格尺度 (cm/格) " + cm.ToString("0.0");
+            return Loc.T("grid.scale", cm.ToString("0.0"));
         }
 
-        private enum PanelKind { None, Map, Network, About }
+        private enum PanelKind { None, Map, Network, Audio, About }
+
+        /// <summary>
+        /// 播放模式。**每次启动都是单曲循环**（用户要求），不持久化 ——
+        /// 免得上一局设成随机，下一局 DM 一放音乐发现变成了别的曲子。
+        /// </summary>
+        private enum AudioPlayMode { RepeatOne, Sequential, Shuffle }
 
         // ============================================================
         //  绘制性能：整窗合成 + 同步重画
@@ -342,6 +349,50 @@ namespace TrpgMaps
         private Label _roomLabel;
         private ModernTextBox _roomPassBox;
         private Button _roomSaveButton;
+
+        // ---------------------------------------------------------- 音频面板
+        // 音乐是"全局"的：面板关掉照旧播，所以状态和定时器都挂在窗体上，
+        // 而不是面板控件里（面板控件是按种类缓存 / 可回收的）。
+        private ModernList _audioList;
+        private ModernSlider _audioSeek;
+        private ModernSlider _audioVolume;
+        private Button _audioPlayButton;
+        private Button _audioPrevButton;
+        private Button _audioNextButton;
+        private Button _audioModeButton;
+        private Button _audioLyricButton;
+        private Label _audioTitle;
+        private Label _audioTime;
+        private Label _audioStatus;
+        private LyricView _audioLyrics;
+        private readonly List<AudioTrack> _audioTracks = new List<AudioTrack>();
+        private int _audioIndex = -1;
+
+        /// <summary>
+        /// 音频树（与素材树同一套折叠菜单）。`_audioRows` 是按展开状态**打平**后
+        /// 真正塞进 <see cref="_audioList"/> 的行 —— 列表项是 <see cref="AudioRow"/>，
+        /// **不是** AudioTrack（绘图面板有过一次「拿 SelectedItem as TerrainAsset」的教训）。
+        /// </summary>
+        private AudioFolder _audioRoot;
+        private readonly List<AudioRow> _audioRows = new List<AudioRow>();
+        private readonly HashSet<string> _audioExpanded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        private sealed class AudioRow
+        {
+            public AudioFolder Folder;
+            public AudioTrack Track;
+            public int Depth;
+            public bool IsFolder { get { return Folder != null; } }
+        }
+        private AudioPlayMode _audioMode = AudioPlayMode.RepeatOne;
+        private Lrc _audioLrc;
+        private bool _audioLyricsVisible = true;
+        private bool _audioSuppressSeek;           // 程序刷进度条时别当成"用户在拖"
+        private bool _audioSuppressSelect;         // 程序改列表选中项时别当成"用户点了"
+        private float _audioPendingSeek = -1f;     // 拖动去抖：真正的 seek 在下一个 tick 做
+        private bool _audioWasPlaying;             // 上一拍在不在播（用来认"刚播完"）
+        private string _audioSignature;            // audio 目录的指纹（路径+大小）
+        private readonly Timer _audioTimer = new Timer();
         private List<LocalAddress> _addresses = new List<LocalAddress>();
         private string _playersSignature;
         private string _qrCacheKey;
@@ -421,6 +472,11 @@ namespace TrpgMaps
             // 有玩家退出房间时要立刻在界面上弹一条胶囊提示（见 ShowPlayerLeftToast）。
             _routes.AttachPlayerLeft(ShowPlayerLeftToast);
 
+            // 音乐放这儿（与 maps、terrain 同级）。第一次运行就自动建出来，
+            // 免得用户自己去猜目录叫什么名字。
+            try { Directory.CreateDirectory(AudioLibrary.Root); }
+            catch (Exception ex) { AppLog.Write("建 audio 目录失败", ex); }
+
             AppLog.Write("房间号：" + _settings.RoomNumber +
                          "，房间密码：" + (_settings.RoomHasPassword ? "已设置" : "无"));
 
@@ -428,7 +484,7 @@ namespace TrpgMaps
             AppLog.Write("绘制模式：整窗合成(WS_EX_COMPOSITED)=" + (!SuppressComposited) +
                          "，面板/侧栏动画=" + (!SuppressPanelAnimation));
             KeyPreview = true;
-            Text = "TrpgMaps";
+            Text = Loc.T("app.title");
             ApplyAppIcon();
             BackColor = Theme.Background;
             StartPosition = FormStartPosition.Manual;
@@ -452,6 +508,13 @@ namespace TrpgMaps
             // 网格锚点变了才播（见 ScheduleAnchorBroadcast）；600ms 足够滤掉拖边框的连发
             _anchorTimer.Interval = 600;
             _anchorTimer.Tick += delegate { _anchorTimer.Stop(); BroadcastAnchorIfChanged(); };
+
+            // 音乐播放的节拍器。**250ms 一直跑**（不是只在音频面板开着时）：
+            // 面板关掉曲子还得接着放，放完还得有人负责切下一首。
+            // 一拍只读几个原生整型，开销可以忽略；面板关着时连控件都不碰。
+            _audioTimer.Interval = 250;
+            _audioTimer.Tick += delegate { AudioTick(); };
+            _audioTimer.Start();
 
             // 窗口尺寸变完之后补画一次（见 ScheduleResizeRepaint）——
             // 整窗合成下"窗口变大后新露出的那一圈"不补就是空的（透出底下的窗口）。
@@ -533,13 +596,14 @@ namespace TrpgMaps
             // 最后一项（"关于"）会被 SidebarPanel 贴到侧栏底部，不参与从顶往下的排布。
             // 顺序必须和 OnSidebarItemClicked 里的 case 号一一对应。
             _sidebar = new SidebarPanel(
-                new[] { "展开", "地图设置", "网络", "绘图", "全屏", "关于" },
+                SidebarLabels(),
                 new[]
                 {
                     Path.Combine(iconDir, "expand.png"),
                     Path.Combine(iconDir, "map.png"),
                     Path.Combine(iconDir, "network.png"),
                     Path.Combine(iconDir, "draw.png"),
+                    Path.Combine(iconDir, "audio.png"),
                     Path.Combine(iconDir, "fullscreen.png"),
                     Path.Combine(iconDir, "about.png")
                 });
@@ -735,17 +799,15 @@ namespace TrpgMaps
 
             // 已经是"阻止"了：系统不会再提示，只能主动改，否则手机永远连不上。
             var answer = MessageBox.Show(this,
-                "Windows 防火墙里有一条『阻止』本程序接收局域网连接的规则。\r\n"
-                + "手机 / 平板扫码也打不开玩家页面，就是它造成的。\r\n\r\n"
-                + "是否现在放行？（会弹一次管理员确认）",
-                "TrpgMaps - 局域网被防火墙挡住",
+                Loc.T("fw.blocked.text"),
+                Loc.T("fw.blocked.title"),
                 MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
 
             if (answer != DialogResult.Yes) return;
             if (ApplyFirewallFix())
             {
                 MessageBox.Show(this,
-                    "已放行。现在用手机连同一个 WiFi，扫码或输入上面的玩家地址即可打开。",
+                    Loc.T("fw.done.text"),
                     "TrpgMaps", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
         }
@@ -786,9 +848,9 @@ namespace TrpgMaps
                 if (!FirewallCheck.RunElevatedRepair(out message))
                 {
                     AppLog.Write("防火墙放行失败：" + message);
-                    SetNetStatus("防火墙放行失败：" + message, true);
+                    SetNetStatus(Loc.T("net.fw.state.fail", message), true);
                     RefreshFirewallStatus();
-                    MessageBox.Show(this, message, "TrpgMaps - 防火墙",
+                    MessageBox.Show(this, message, Loc.T("fw.title"),
                         MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return false;
                 }
@@ -811,11 +873,11 @@ namespace TrpgMaps
 
             if (_firewall.State == FirewallState.Allowed)
             {
-                SetNetStatus("防火墙已放行，手机应该能正常访问", false);
+                SetNetStatus(Loc.T("net.fw.state.allowed"), false);
                 return;
             }
 
-            if (ApplyFirewallFix()) SetNetStatus("防火墙已放行，手机现在可以访问了", false);
+            if (ApplyFirewallFix()) SetNetStatus(Loc.T("net.fw.state.fixed"), false);
         }
 
         /// <summary>把当前防火墙状态写到网络面板的提示行上。</summary>
@@ -827,19 +889,19 @@ namespace TrpgMaps
             switch (_firewall.State)
             {
                 case FirewallState.Allowed:
-                    _fwLabel.Text = "防火墙：已放行";
+                    _fwLabel.Text = Loc.T("fw.label.allowed");
                     _fwLabel.ForeColor = Theme.Success;
                     break;
                 case FirewallState.Blocked:
-                    _fwLabel.Text = "防火墙：被阻止，手机连不上";
+                    _fwLabel.Text = Loc.T("fw.label.blocked");
                     _fwLabel.ForeColor = Theme.Error;
                     break;
                 case FirewallState.NoRule:
-                    _fwLabel.Text = "防火墙：未放行，首次连接会弹系统授权框";
+                    _fwLabel.Text = Loc.T("fw.label.norule");
                     _fwLabel.ForeColor = Theme.TextDim;
                     break;
                 default:
-                    _fwLabel.Text = "防火墙：状态未知（" + _firewall.Error + "）";
+                    _fwLabel.Text = Loc.T("fw.label.unknown", _firewall.Error);
                     _fwLabel.ForeColor = Theme.TextDim;
                     break;
             }
@@ -985,6 +1047,9 @@ namespace TrpgMaps
                 steps.Add(new ShotStep("drawtangent", Path.Combine(path, "14-draw-tangent.png")));
                 // 关于面板放最后：它会先把绘图面板关掉，不影响前面的画面。
                 steps.Add(new ShotStep("about", Path.Combine(path, "15-about.png")));
+                // 音频面板（v1.0.2）。排在关于之后：它和底图/绘图状态都无关，
+                // 放最后拍不会踩到前面任何一张的前置条件。
+                steps.Add(new ShotStep("audio", Path.Combine(path, "16-audio.png")));
                 return steps;
             }
 
@@ -1205,6 +1270,12 @@ namespace TrpgMaps
                     ApplyShotSidebarWidth(true);
                     OpenPanel(PanelKind.About);
                     break;
+                case "audio":          // 侧栏展开 + 音频面板（曲目表 / 进度 / 歌词）
+                    if (_drawPanelOpen) CloseDrawPanel();
+                    ApplyShotSidebarWidth(true);
+                    OpenPanel(PanelKind.Audio);
+                    ScheduleAudioShotDemo();
+                    break;
                 case "rotate90":       // 底图顺时针转 90°（看旋转有没有真的生效）
                     ApplyShotSidebarWidth(true);
                     SelectFirstMapForShot();
@@ -1223,6 +1294,16 @@ namespace TrpgMaps
                     ApplyShotSidebarWidth(true);
                     SelectFirstMapForShot();
                     OpenDrawPanel();
+                    _drawPanel.SelectFirstAssetForShot();
+                    break;
+
+                case "drawentity":     // 实体分类：验证「文件夹 = 可折叠菜单」
+                    CloseAll();
+                    ApplyShotSidebarWidth(true);
+                    SelectFirstMapForShot();
+                    OpenDrawPanel();
+                    _drawPanel.SetKind(DrawKind.Entity);
+                    _drawPanel.ExpandAllForShot();
                     _drawPanel.SelectFirstAssetForShot();
                     break;
                 case "drawbrush":      // 笔刷模式：放好原点、摆出一个选区，看半透明红与距离读数
@@ -1291,6 +1372,53 @@ namespace TrpgMaps
         /// <summary>
         /// `--ui fs` 用：600ms 后（框架抓图之前）把整棵树**强制**同步补画一遍。
         /// </summary>
+        private void ScheduleAudioShotDemo()
+        {
+            // `--ui audio` 用：光开面板看不到歌词（要有人在听才滚动），
+            // 所以这里自己挑一首打开、跳到第 7 秒停住 —— 三行歌词都有内容。
+            // **音量拍到 0**：无人值守截图时不能突然出声。
+            var timer = new Timer();
+            timer.Interval = 400;
+            timer.Tick += delegate
+            {
+                timer.Stop();
+                timer.Dispose();
+
+                if (_audioTracks.Count == 0) return;
+
+                // 截图要看到曲目，不是两个折叠着的文件夹
+                ExpandAllAudioForShot();
+                RepopulateAudioList();
+
+                AudioEngine.SetVolume(0f);
+                if (_audioVolume != null) _audioVolume.Value = 0;
+
+                // ---- 顺手验一下"点列表就播放"这条路 ----
+                // 之前这里有个自作聪明的 bug：面板刷按钮时会把列表选中项"同步"回正在播放的
+                // 那首，于是刚点亮的选中立刻被改回去 —— 表现就是"列表点不动"。
+                // 所以这里模拟两次点击，点完看 _audioIndex 有没有真的跟着走。
+                var clickOk = true;
+                var probe = Math.Min(2, _audioTracks.Count - 1);
+                if (_audioList != null && probe != 0)
+                {
+                    // ⚠️ 列表里还有文件夹行，行号 != 曲目序号 —— 必须走 SelectAudioTrackRow
+                    clickOk = SelectAudioTrackRow(probe) && _audioIndex == probe;
+                }
+                if (_audioList != null)
+                {
+                    clickOk = SelectAudioTrackRow(0) && clickOk && _audioIndex == 0;
+                }
+                AppLog.Write(clickOk
+                    ? "音频面板自检：列表点击正常（切到第 " + (probe + 1) + " 首再切回第 1 首都生效）"
+                    : "音频面板自检**失败**：点了列表但当前曲目没跟着变（列表点击没生效）");
+
+                AudioEngine.Seek(7f);
+                AudioEngine.Pause();
+                RefreshAudioLyrics();
+            };
+            timer.Start();
+        }
+
         private void ScheduleShotForceRepaint()
         {
             var t = new Timer();
@@ -1346,9 +1474,28 @@ namespace TrpgMaps
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
+            AppLog.Write("关闭请求：原因=" + e.CloseReason + "，noPrompts=" + NoPrompts +
+                         "，headless=" + Headless + "，已确认=" + _closeConfirmed);
+
+            // 关闭确认：只有"用户自己关窗"才问（点 X、Alt+F4）。
+            // 系统关机 / 应用退出 / 自动化测试（--no-prompts）都不该被这个框挡住。
+            if (!_closeConfirmed && !NoPrompts && !Headless &&
+                e.CloseReason == CloseReason.UserClosing)
+            {
+                if (!ConfirmDialog.Ask(this, Loc.T("close.title"), Loc.T("close.text"),
+                        Loc.T("common.confirm"), Loc.T("common.cancel")))
+                {
+                    e.Cancel = true;
+                    return;
+                }
+                _closeConfirmed = true;
+            }
+
             _animTimer.Stop();
             _addressTimer.Stop();
             _playerTimer.Stop();
+            _audioTimer.Stop();
+            AudioEngine.Shutdown();      // 关音频设备，不然线程会拖着进程不走
 
             // 关程序时把绘图内容落盘（拖动中的改动可能还攒在延时定时器里）
             _drawSaveTimer.Stop();
@@ -1683,9 +1830,13 @@ namespace TrpgMaps
                     ToggleDrawPanel();
                     break;
                 case 4:
-                    ApplyFullscreen(!_fullscreen);
+                    // 音频播放器（v1.0.2 加）。按钮放在「全屏」上面一格。
+                    TogglePanel(PanelKind.Audio);
                     break;
                 case 5:
+                    ApplyFullscreen(!_fullscreen);
+                    break;
+                case 6:
                     // "关于 / 署名"。走的是和地图设置、网络一样的浮空面板逻辑
                     // （左侧抽屉 + 灰色遮罩 + 侧栏收回），只有绘图面板是例外。
                     TogglePanel(PanelKind.About);
@@ -2041,6 +2192,7 @@ namespace TrpgMaps
             _playersSignature = null;
             _avatarBox = null;
             _updateStatus = null;
+            _langCombo = null;
 
             if (_panelContent != null)
             {
@@ -2088,6 +2240,9 @@ namespace TrpgMaps
                 _mapList, _ipCombo, _portBox, _saveButton, _netStatus, _fwLabel, _fwButton,
                 _qrBox, _urlLabel, _playerList, _roomLockButton, _rotateLabel, _playersSignature,
                 _avatarBox, _updateStatus, _roomLabel, _roomPassBox, _roomSaveButton,
+                _audioList, _audioSeek, _audioVolume, _audioPlayButton, _audioPrevButton,
+                _audioNextButton, _audioModeButton, _audioLyricButton, _audioTitle, _audioTime,
+                _audioStatus, _audioLyrics, _langCombo,
             };
         }
 
@@ -2119,6 +2274,19 @@ namespace TrpgMaps
             _roomLabel = (Label)r[21];
             _roomPassBox = (ModernTextBox)r[22];
             _roomSaveButton = (Button)r[23];
+            _audioList = (ModernList)r[24];
+            _audioSeek = (ModernSlider)r[25];
+            _audioVolume = (ModernSlider)r[26];
+            _audioPlayButton = (Button)r[27];
+            _audioPrevButton = (Button)r[28];
+            _audioNextButton = (Button)r[29];
+            _audioModeButton = (Button)r[30];
+            _audioLyricButton = (Button)r[31];
+            _audioTitle = (Label)r[32];
+            _audioTime = (Label)r[33];
+            _audioStatus = (Label)r[34];
+            _audioLyrics = (LyricView)r[35];
+            _langCombo = (ModernDropDown)r[36];
         }
 
         private static int Clamp(int value, int min, int max)
@@ -2177,6 +2345,7 @@ namespace TrpgMaps
 
             if (kind == PanelKind.Map) BuildMapPanel();
             else if (kind == PanelKind.Network) BuildNetworkPanel();
+            else if (kind == PanelKind.Audio) BuildAudioPanel();
             else BuildAboutPanel();
 
             _panelContent.ResumeLayout(false);
@@ -2225,6 +2394,10 @@ namespace TrpgMaps
                 RefreshPlayerControls();
                 StartPolling();
             }
+            else if (kind == PanelKind.Audio)
+            {
+                RefreshAudioPanel();
+            }
             // 关于面板没有要刷的数据（网卡、名册、底图列表它都不关心），
             // 所以这里什么都不做 —— 别顺手调 RefreshSettings()，
             // 那会去枚举网卡，在没插网线的机器上白等一秒。
@@ -2238,7 +2411,7 @@ namespace TrpgMaps
 
         private void BuildMapPanel()
         {
-            AddTitle("地图设置");
+            AddTitle(Loc.T("map.title"));
             AddSeparator();
 
             // 滑块和标签都从窗口上的 _cmPerCell 初始化，而不是写死 2.0：
@@ -2267,7 +2440,7 @@ namespace TrpgMaps
             // 网格线颜色：AI 生成的地图明暗差别很大，纯白线铺在亮底图上、
             // 纯黑线铺在暗底图上都会"糊"掉。默认交给程序按底图平均亮度自动选，
             // 判定不合适的图可以在这里手动锁死。
-            AddRow(MakeLabel("网格颜色：", 9f, Theme.Text), 20);
+            AddRow(MakeLabel(Loc.T("map.gridcolor"), 9f, Theme.Text), 20);
 
             _gridColorCombo = new ModernDropDown();
             _gridColorCombo.SetItems(GridColorItems(), GridColorIndexOf(_maps.GridMode));
@@ -2282,12 +2455,12 @@ namespace TrpgMaps
             AddRow(_gridColorCombo, 30);
 
             _gridColorHint = MakeLabel(GridColorHintText(), 8.5f, Theme.TextDim);
-            AddRow(_gridColorHint, 18);
+            AddRow(_gridColorHint, 30);   // 英文比中文长，留两行
 
-            AddRow(MakeLabel("底图显示模式：", 9f, Theme.Text), 20);
+            AddRow(MakeLabel(Loc.T("map.fit"), 9f, Theme.Text), 20);
             _fitCombo = new ModernDropDown();
             _fitCombo.SetItems(
-                new List<string> { "拉伸（铺满）", "填充（保持比例）" },
+                new List<string> { Loc.T("map.fit.fill"), Loc.T("map.fit.contain") },
                 _maps.FitMode == "contain" ? 1 : 0);
             _fitCombo.SelectedIndexChanged += delegate
             {
@@ -2303,15 +2476,15 @@ namespace TrpgMaps
 
             // 底图旋转：只转图片，网格不动（网格是桌面上的实体战斗网格）。
             // 90° 用增量，连点四次绕一圈；180° 就是 delta=180。
-            AddRow(MakeLabel("底图旋转（顺时针）：", 9f, Theme.Text), 20);
+            AddRow(MakeLabel(Loc.T("map.rotate"), 9f, Theme.Text), 20);
 
             var rotateRow = MakeRowPanel(new Padding(0, 0, 0, 10));
 
-            var rotate90 = MakeButton("顺时针 90°", false, true);
+            var rotate90 = MakeButton(Loc.T("map.rotate90"), false, true);
             rotate90.Click += delegate { RotateMap(90); };
             rotateRow.Controls.Add(rotate90);
 
-            var rotate180 = MakeButton("旋转 180°", false, true);
+            var rotate180 = MakeButton(Loc.T("map.rotate180"), false, true);
             rotate180.Margin = new Padding(8, 3, 0, 0);
             rotate180.Click += delegate { RotateMap(180); };
             rotateRow.Controls.Add(rotate180);
@@ -2325,11 +2498,11 @@ namespace TrpgMaps
 
             var buttons = MakeRowPanel(new Padding(0, 0, 0, 10));
 
-            var import = MakeButton("导入图片", true, false);
+            var import = MakeButton(Loc.T("map.import"), true, false);
             import.Click += delegate { ImportMap(); };
             buttons.Controls.Add(import);
 
-            _uploadStatus = MakeLabel("就绪", 8.5f, Theme.TextDim);
+            _uploadStatus = MakeLabel(Loc.T("map.ready"), 8.5f, Theme.TextDim);
             _uploadStatus.AutoSize = true;
             _uploadStatus.Margin = new Padding(8, 8, 0, 0);
             buttons.Controls.Add(_uploadStatus);
@@ -2338,12 +2511,12 @@ namespace TrpgMaps
 
             var header = MakeRowPanel(new Padding(0, 0, 0, 6));
 
-            var listTitle = MakeLabel("底图列表", 9f, Theme.Text);
+            var listTitle = MakeLabel(Loc.T("map.list"), 9f, Theme.Text);
             listTitle.AutoSize = true;
             listTitle.Margin = new Padding(0, 4, 8, 0);
             header.Controls.Add(listTitle);
 
-            var refresh = MakeButton("刷新", false, true);
+            var refresh = MakeButton(Loc.T("map.refresh"), false, true);
             refresh.Click += delegate { RefreshMapList(); };
             header.Controls.Add(refresh);
 
@@ -2359,11 +2532,11 @@ namespace TrpgMaps
 
             var actions = MakeRowPanel(new Padding(0, 8, 0, 0));
 
-            var fill = MakeButton("拉伸显示", false, true);
+            var fill = MakeButton(Loc.T("map.display.fill"), false, true);
             fill.Click += delegate { SelectCurrentListItem("fill"); };
             actions.Controls.Add(fill);
 
-            var contain = MakeButton("填充显示", false, true);
+            var contain = MakeButton(Loc.T("map.display.contain"), false, true);
             contain.Margin = new Padding(8, 3, 0, 0);
             contain.Click += delegate { SelectCurrentListItem("contain"); };
             actions.Controls.Add(contain);
@@ -2375,12 +2548,12 @@ namespace TrpgMaps
             // 误点代价大得多，所以单独一行、用警示色。
             var removeRow = MakeRowPanel(new Padding(0, 12, 0, 0));
 
-            var removeMap = MakeButton("撤掉地图", false, true);
+            var removeMap = MakeButton(Loc.T("map.remove"), false, true);
             removeMap.BackColor = Theme.Danger;
             removeMap.Click += delegate { RemoveMap(); };
             removeRow.Controls.Add(removeMap);
 
-            var removeHint = MakeLabel("撤掉后只剩网格（maps\\ 里的文件不删）", 8f, Theme.TextDim);
+            var removeHint = MakeLabel(Loc.T("map.remove.hint"), 8f, Theme.TextDim);
             removeHint.AutoSize = true;
             removeHint.Margin = new Padding(10, 7, 0, 0);
             removeRow.Controls.Add(removeHint);
@@ -2404,7 +2577,7 @@ namespace TrpgMaps
             {
                 if (_uploadStatus != null)
                 {
-                    _uploadStatus.Text = "本来就没有底图";
+                    _uploadStatus.Text = Loc.T("map.none");
                     _uploadStatus.ForeColor = Theme.TextDim;
                 }
                 return;
@@ -2415,7 +2588,7 @@ namespace TrpgMaps
 
             if (_uploadStatus != null)
             {
-                _uploadStatus.Text = "已撤掉：" + removed;
+                _uploadStatus.Text = Loc.T("map.removed", removed);
                 _uploadStatus.ForeColor = Theme.Success;
             }
         }
@@ -2598,19 +2771,21 @@ namespace TrpgMaps
         {
             using (var dialog = new OpenFileDialog())
             {
-                dialog.Title = "选择底图图片";
-                dialog.Filter = "图片文件|*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp|所有文件|*.*";
+                dialog.Title = Loc.T("map.pick.title");
+                dialog.Filter = Loc.T("map.pick.filter");
                 if (dialog.ShowDialog(this) != DialogResult.OK) return;
 
                 try
                 {
-                    if (_uploadStatus != null) _uploadStatus.Text = "上传中…";
+                    if (_uploadStatus != null) _uploadStatus.Text = Loc.T("map.uploading");
                     var bytes = File.ReadAllBytes(dialog.FileName);
                     var result = _maps.Upload(Path.GetFileName(dialog.FileName), bytes);
 
                     if (_uploadStatus != null)
                     {
-                        _uploadStatus.Text = result.Success ? "导入成功" : "导入失败：" + result.Message;
+                        _uploadStatus.Text = result.Success
+                            ? Loc.T("map.import.ok")
+                            : Loc.T("map.import.fail", result.Message);
                         _uploadStatus.ForeColor = result.Success ? Theme.Success : Theme.Error;
                     }
                     RefreshMapList();
@@ -2620,7 +2795,7 @@ namespace TrpgMaps
                     AppLog.Write("导入底图失败", ex);
                     if (_uploadStatus != null)
                     {
-                        _uploadStatus.Text = "导入失败：" + ex.Message;
+                        _uploadStatus.Text = Loc.T("map.import.fail", ex.Message);
                         _uploadStatus.ForeColor = Theme.Error;
                     }
                 }
@@ -2643,14 +2818,17 @@ namespace TrpgMaps
 
         private static string RotateLabelText(int rotation)
         {
-            return "当前 " + rotation + "°";
+            return Loc.T("map.rotation.now", rotation);
         }
 
         // ---------------- 网格颜色 ----------------
 
         private static List<string> GridColorItems()
         {
-            return new List<string> { "自动（跟随底图）", "白色", "黑色" };
+            return new List<string>
+            {
+                Loc.T("map.grid.auto"), Loc.T("map.grid.white"), Loc.T("map.grid.black")
+            };
         }
 
         private static int GridColorIndexOf(string mode)
@@ -2675,16 +2853,16 @@ namespace TrpgMaps
         private string GridColorHintText()
         {
             var color = _maps.ResolveGridColor();
-            var label = color == "black" ? "黑线" : "白线";
+            var label = Loc.T(color == "black" ? "map.grid.line.black" : "map.grid.line.white");
 
-            if (_maps.GridMode != "auto") return "固定" + label;
-            if (string.IsNullOrEmpty(_maps.CurrentMap)) return "自动 → 白线（未选底图，深色底）";
+            if (_maps.GridMode != "auto") return Loc.T("map.grid.fixed", label);
+            if (string.IsNullOrEmpty(_maps.CurrentMap)) return Loc.T("map.grid.nomap");
 
             var tone = _maps.CurrentTone();
-            if (!tone.Ok) return "自动 → " + label + "（底图读不出来，按白线处理）";
+            if (!tone.Ok) return Loc.T("map.grid.unreadable", label);
 
-            return "自动 → " + label + "（底图平均亮度 " + tone.Mean.ToString("0.00") +
-                   (tone.Mean < MapTone.Threshold ? "，偏暗）" : "，偏亮）");
+            return Loc.T("map.grid.measured", label, tone.Mean.ToString("0.00"),
+                Loc.T(tone.Mean < MapTone.Threshold ? "map.grid.dark" : "map.grid.bright"));
         }
 
         /// <summary>把解析出来的网格线颜色应用到画布，并刷新那行说明。</summary>
@@ -2777,14 +2955,14 @@ namespace TrpgMaps
 
         private void BuildNetworkPanel()
         {
-            AddTitle("网络连接");
+            AddTitle(Loc.T("net.title"));
             AddSeparator();
 
-            AddRow(MakeLabel("IP 地址", 9f, Theme.Text), 20);
+            AddRow(MakeLabel(Loc.T("net.ip"), 9f, Theme.Text), 20);
             _ipCombo = new ModernDropDown();
             AddRow(_ipCombo, 30);
 
-            AddRow(MakeLabel("端口（1-65535）", 9f, Theme.Text), 20);
+            AddRow(MakeLabel(Loc.T("net.port"), 9f, Theme.Text), 20);
             _portBox = new ModernTextBox();
             _portBox.MaxLength = 5;                 // 端口最多 5 位数，输入框没必要占满整行
             _portBox.Text = _settings.Port.ToString();
@@ -2794,7 +2972,7 @@ namespace TrpgMaps
             };
             AddRow(_portBox, 30, 104);
 
-            _saveButton = MakeButton("保存并重开服务", true, false);
+            _saveButton = MakeButton(Loc.T("net.save.restart"), true, false);
             _saveButton.Click += delegate { SaveSettings(); };
             AddRow(_saveButton, 34);
 
@@ -2806,7 +2984,7 @@ namespace TrpgMaps
             _fwLabel = MakeLabel(string.Empty, 8.5f, Theme.TextDim);
             AddRow(_fwLabel, 20);
 
-            _fwButton = MakeButton("放行防火墙（需管理员确认）", false, true);
+            _fwButton = MakeButton(Loc.T("net.fw"), false, true);
             _fwButton.Click += delegate { FixFirewallFromUi(); };
             AddRow(_fwButton, 30, 210);
             RefreshFirewallStatus();
@@ -2816,11 +2994,11 @@ namespace TrpgMaps
             // ---------------- 房间 ----------------
             // 房间号每次启动都会换一个新的（见 Core/Room.cs）。这里显示的必须是
             // "当前这次运行"的号，所以 RefreshSettings() 每次都从 _settings 现取。
-            AddRow(MakeLabel("房间号（每次启动都会换一个新的）", 9f, Theme.Text), 20);
+            AddRow(MakeLabel(Loc.T("net.room"), 9f, Theme.Text), 20);
             _roomLabel = MakeLabel(_settings.RoomNumber, 15f, Theme.Link);
             AddRow(_roomLabel, 30);
 
-            AddRow(MakeLabel("房间密码（留空 = 不需要密码）", 9f, Theme.Text), 20);
+            AddRow(MakeLabel(Loc.T("net.pass"), 9f, Theme.Text), 20);
             _roomPassBox = new ModernTextBox();
             _roomPassBox.MaxLength = RoomState.MaxPasswordLength;
             _roomPassBox.Text = _settings.Room.Password;
@@ -2834,13 +3012,13 @@ namespace TrpgMaps
             };
             AddRow(_roomPassBox, 30);
 
-            _roomSaveButton = MakeButton("保存密码并刷新地址", true, false);
+            _roomSaveButton = MakeButton(Loc.T("net.pass.save"), true, false);
             _roomSaveButton.Click += delegate { SaveRoomPassword(); };
             AddRow(_roomSaveButton, 34);
 
             AddSeparator();
 
-            AddRow(MakeLabel("玩家地址", 11f, Color.White), 26);
+            AddRow(MakeLabel(Loc.T("net.url"), 11f, Color.White), 26);
             _urlLabel = MakeLabel(_settings.PlayerUrl, 8.5f, Theme.Link);
             // 三行位置：带密码的地址一行放不下，RefreshUrlLabel() 会拆成
             // "主机:端口 / 房间路径 / 密码" 三行（见 UpdatePlayerUrlLabel）。
@@ -2857,20 +3035,20 @@ namespace TrpgMaps
             qrRow.Controls.Add(_qrBox);
             _panelContent.Controls.Add(qrRow);
 
-            var qrHint = MakeLabel("手机扫码即可加入（地址里带着房间号和密码）", 8f, Theme.TextDim);
+            var qrHint = MakeLabel(Loc.T("net.qr"), 8f, Theme.TextDim);
             qrHint.TextAlign = ContentAlignment.MiddleCenter;
-            AddRow(qrHint, 20);
+            AddRow(qrHint, 32);            // 英文两行
 
             AddSeparator();
 
             var header = MakeRowPanel(new Padding(0, 0, 0, 6));
 
-            var playersTitle = MakeLabel("在线玩家", 11f, Color.White);
+            var playersTitle = MakeLabel(Loc.T("net.players"), 11f, Color.White);
             playersTitle.AutoSize = true;
             playersTitle.Margin = new Padding(0, 6, 8, 0);
             header.Controls.Add(playersTitle);
 
-            _roomLockButton = MakeButton("锁定房间", false, true);
+            _roomLockButton = MakeButton(Loc.T("net.room.lock"), false, true);
             _roomLockButton.Click += delegate { ToggleRoomLock(); };
             header.Controls.Add(_roomLockButton);
 
@@ -2883,7 +3061,7 @@ namespace TrpgMaps
             _playerList.ItemDraw = DrawPlayerItem;
             AddRow(_playerList, 150);
 
-            var kick = MakeButton("踢出选中玩家", false, true);
+            var kick = MakeButton(Loc.T("net.kick"), false, true);
             kick.BackColor = Theme.Danger;
             kick.Click += delegate { KickSelectedPlayer(); };
             AddRow(kick, 30);
@@ -2987,8 +3165,8 @@ namespace TrpgMaps
             RefreshQrImage();
 
             SetNetStatus(effective.Length == 0
-                ? "已清除房间密码（任何人都能加入）"
-                : "房间密码已设置（" + effective.Length + " 个字符）", false);
+                ? Loc.T("net.pass.cleared")
+                : Loc.T("net.pass.set", effective.Length), false);
 
             // 已经在房里的玩家页面也要知道"现在开始要密码了"
             _routes.BroadcastRoomState();
@@ -3020,7 +3198,7 @@ namespace TrpgMaps
                 return;
             }
 
-            _toastText = (name ?? string.Empty) + " 离开了房间";
+            _toastText = Loc.T("net.left", name ?? string.Empty);
             _toastPhase = 0;
             _toastPhaseStart = Environment.TickCount;
             if (_canvas != null) _canvas.SetToast(_toastText, ToastHiddenY);
@@ -3075,7 +3253,8 @@ namespace TrpgMaps
         private void UpdateRoomLockButton()
         {
             if (_roomLockButton == null) return;
-            _roomLockButton.Text = _settings.RoomLocked ? "解锁房间" : "锁定房间";
+            _roomLockButton.Text = _settings.RoomLocked
+                ? Loc.T("net.room.unlock") : Loc.T("net.room.lock");
             _roomLockButton.BackColor = _settings.RoomLocked ? Theme.Locked : Theme.Button;
         }
 
@@ -3168,7 +3347,7 @@ namespace TrpgMaps
             var ip = SelectedAddress();
             if (ip == null)
             {
-                SetNetStatus("请先选择一个 IP 地址", true);
+                SetNetStatus(Loc.T("net.err.ip"), true);
                 return;
             }
 
@@ -3176,7 +3355,7 @@ namespace TrpgMaps
             if (!int.TryParse(_portBox == null ? string.Empty : _portBox.Text, out port) ||
                 !ServerSettings.IsValidPort(port))
             {
-                SetNetStatus("端口必须是 1-65535 之间的整数", true);
+                SetNetStatus(Loc.T("net.err.port"), true);
                 return;
             }
 
@@ -3191,14 +3370,14 @@ namespace TrpgMaps
             string message;
             if (!_settings.TryUpdate(ip, port, out message))
             {
-                SetNetStatus("失败：" + message, true);
+                SetNetStatus(Loc.T("net.err.save", message), true);
                 return;
             }
 
             if (changed)
             {
                 if (_saveButton != null) _saveButton.Enabled = false;
-                SetNetStatus("正在用新地址重开服务…", false);
+                SetNetStatus(Loc.T("net.restarting"), false);
 
                 try
                 {
@@ -3209,8 +3388,8 @@ namespace TrpgMaps
                     _hub.Broadcast("server_moved", MiniJson.WriteObject("playerUrl", _settings.PlayerUrl));
                     _hub.Broadcast("map_change", MapPayloadFor(_maps.CurrentMap, _maps.FitMode));
 
-                    SetNetStatus("已切换到 " + _settings.ListenIp + ":" + _settings.Port +
-                                 "（底图与名册已保留）", false);
+                    SetNetStatus(Loc.T("net.switched",
+                        _settings.ListenIp + ":" + _settings.Port), false);
                 }
                 catch (Exception ex)
                 {
@@ -3225,13 +3404,13 @@ namespace TrpgMaps
                     try
                     {
                         _server.Start(previousPort);
-                        SetNetStatus("新端口没起来（" + reason + "），已退回 " +
-                                     previousIp + ":" + previousPort, true);
+                        SetNetStatus(Loc.T("net.reverted", reason,
+                            previousIp + ":" + previousPort), true);
                     }
                     catch (Exception ex2)
                     {
                         AppLog.Write("退回原端口也失败", ex2);
-                        SetNetStatus("新端口起不来（" + reason + "），原端口也回不去了", true);
+                        SetNetStatus(Loc.T("net.revert.failed", reason), true);
                     }
                 }
                 finally
@@ -3241,7 +3420,7 @@ namespace TrpgMaps
             }
             else
             {
-                SetNetStatus("配置未变化", false);
+                SetNetStatus(Loc.T("net.unchanged"), false);
             }
 
             if (_urlLabel != null) _urlLabel.Text = _settings.PlayerUrl;
@@ -3278,17 +3457,16 @@ namespace TrpgMaps
                 _settings.SetPort(candidate);
                 if (candidate != wanted)
                 {
-                    var reason = "未知原因";
+                    var reason = Loc.T("net.reason.unknown");
                     string hint;
                     if (last != null && PortPicker.IsPortBlocked(last, out hint)) reason = hint;
                     else if (last != null) reason = last.Message;
                     AppLog.Write("端口 " + wanted + " 绑不上（" + reason + "），已改用 " + candidate);
-                    SetNetStatus("端口 " + wanted + " 不可用，已自动改用 " + candidate, true);
+                    SetNetStatus(Loc.T("net.port.auto", wanted, candidate), true);
                     if (!Headless)
                     {
                         MessageBox.Show(this,
-                            "默认端口 " + wanted + " 用不了：" + reason + "\r\n\r\n" +
-                            "已自动改用端口 " + candidate + "，玩家地址见「网络」面板。",
+                            Loc.T("net.port.auto.text", wanted, reason, candidate),
                             "TrpgMaps", MessageBoxButtons.OK, MessageBoxIcon.Information);
                     }
                 }
@@ -3302,7 +3480,7 @@ namespace TrpgMaps
             if (!Headless)
             {
                 MessageBox.Show(this,
-                    "内置服务器启动失败：找不到可用端口。\r\n" + (last == null ? "" : last.Message),
+                    Loc.T("net.port.dead", last == null ? string.Empty : last.Message),
                     "TrpgMaps", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
@@ -3401,8 +3579,8 @@ namespace TrpgMaps
 
             var name = players[_playerList.SelectedIndex].Name;
             var answer = MessageBox.Show(this,
-                "确定要踢出 " + name + " 吗？\r\n（他带着原令牌仍可重新进入）",
-                "踢出玩家", MessageBoxButtons.OKCancel, MessageBoxIcon.Question);
+                Loc.T("net.kick.confirm", name),
+                Loc.T("net.kick.title"), MessageBoxButtons.OKCancel, MessageBoxIcon.Question);
             if (answer != DialogResult.OK) return;
 
             var connectionId = _game.Kick(name);
@@ -3419,9 +3597,908 @@ namespace TrpgMaps
         //  关于 / 署名 / 更新
         // ============================================================
 
+        // ============================================================
+        //  音频播放器（v1.0.2 加）
+        // ============================================================
+        //
+        //  两条设计原则，都是想清楚才定的：
+        //   ① **音乐与面板解耦**：关掉面板、去改地图、切全屏，曲子都要接着放。
+        //      所以"当前曲目 / 播放模式 / 定时器"挂在窗体上，面板控件只是显示器。
+        //   ② **不跟外层面板抢滚动**：歌词用三行式（见 LyricView），曲目表用
+        //      ModernList 自带的细滚动条 —— 面板本身已经在滚了，里面再套滚轮会打架。
+        //
+        //  播放模式**每次启动都是单曲循环**（用户要求），不写进任何配置文件。
+
+        private void BuildAudioPanel()
+        {
+            AddTitle(Loc.T("audio.title"));
+
+            if (!AudioEngine.Available)
+            {
+                var why = MakeLabel(AudioEngine.UnavailableReason, 9f, Theme.Error);
+                AddRow(why, 40);
+                var hint = MakeLabel(Loc.T("audio.dll.hint"),
+                                     8.5f, Theme.TextDim);
+                AddRow(hint, 34);
+                return;
+            }
+
+            // 这两句原来比面板宽，被硬切在一半（标签没有省略号）—— 文案已压短，回到一行高
+            AddRow(MakeLabel(Loc.T("audio.hint1"),
+                             8.5f, Theme.TextDim), 20);
+            AddRow(MakeLabel(Loc.T("audio.supported", AudioLibrary.ExtensionList),
+                             8.5f, Theme.TextDim), 20);
+            AddSeparator();
+
+            // ---- 当前曲目 ----
+            _audioTitle = MakeLabel(Loc.T("audio.none"), 9.5f, Color.White);
+            AddRow(_audioTitle, 24);
+
+            // ---- 进度条（拖动时先记下来，下一个 tick 才真 seek，见 OnAudioSeekDragged）----
+            _audioSeek = new ModernSlider();
+            _audioSeek.Minimum = 0;
+            _audioSeek.Maximum = 1000;
+            _audioSeek.Height = 22;
+            _audioSeek.ValueChanged += delegate { OnAudioSeekDragged(); };
+            AddRow(_audioSeek, 28);
+
+            var timeRow = MakeRowPanel(new Padding(0, 0, 0, 8));
+            _audioTime = MakeLabel("0:00 / 0:00", 8.5f, Theme.TextDim);
+            _audioTime.AutoSize = true;
+            timeRow.Controls.Add(_audioTime);
+
+            _audioStatus = MakeLabel(string.Empty, 8.5f, Theme.Link);
+            _audioStatus.AutoSize = true;
+            _audioStatus.Margin = new Padding(12, 0, 0, 0);
+            timeRow.Controls.Add(_audioStatus);
+            _panelContent.Controls.Add(timeRow);
+
+            // ---- 上一曲 / 播放暂停 / 下一曲 ----
+            var transport = MakeRowPanel(new Padding(0, 0, 0, 8));
+
+            _audioPrevButton = MakeButton(Loc.T("audio.prev"), false, true);
+            _audioPrevButton.Click += delegate { AudioSkip(-1); };
+            transport.Controls.Add(_audioPrevButton);
+
+            _audioPlayButton = MakeButton(Loc.T("audio.play"), true, true);
+            _audioPlayButton.Margin = new Padding(8, 3, 0, 0);
+            _audioPlayButton.Click += delegate { ToggleAudioPlay(); };
+            transport.Controls.Add(_audioPlayButton);
+
+            _audioNextButton = MakeButton(Loc.T("audio.next"), false, true);
+            _audioNextButton.Margin = new Padding(8, 3, 0, 0);
+            _audioNextButton.Click += delegate { AudioSkip(1); };
+            transport.Controls.Add(_audioNextButton);
+            _panelContent.Controls.Add(transport);
+
+            // ---- 播放模式 / 歌词开关 ----
+            var modes = MakeRowPanel(new Padding(0, 0, 0, 8));
+
+            _audioModeButton = MakeButton(AudioModeText(), false, true);
+            _audioModeButton.Click += delegate { CycleAudioMode(); };
+            modes.Controls.Add(_audioModeButton);
+
+            _audioLyricButton = MakeButton(_audioLyricsVisible ? Loc.T("audio.hidelyrics") : Loc.T("audio.showlyrics"), false, true);
+            _audioLyricButton.Margin = new Padding(8, 3, 0, 0);
+            _audioLyricButton.Click += delegate { ToggleAudioLyrics(); };
+            modes.Controls.Add(_audioLyricButton);
+            _panelContent.Controls.Add(modes);
+
+            // ---- 音量 ----
+            AddRow(MakeLabel(Loc.T("audio.volume"), 9f, Theme.Text), 20);
+            _audioVolume = new ModernSlider();
+            _audioVolume.Minimum = 0;
+            _audioVolume.Maximum = 100;
+            _audioVolume.Value = (int)Math.Round(AudioEngine.Volume * 100f);
+            _audioVolume.Height = 22;
+            _audioVolume.ValueChanged += delegate { OnAudioVolumeChanged(); };
+            AddRow(_audioVolume, 26);
+
+            AddSeparator();
+
+            // ---- 曲目列表（点一下播放）----
+            AddRow(MakeLabel(Loc.T("audio.tracks"), 9f, Theme.Text), 22);
+            _audioList = new ModernList();
+            _audioList.ItemHeight = 26;
+            _audioList.RoundedRows = true;
+            _audioList.ItemDraw = DrawAudioItem;
+            // 文件夹行矮一点、曲目行保持 26px；文件夹不可选中（只展开/折叠）
+            _audioList.RowHeight = delegate(object item)
+            {
+                var row = item as AudioRow;
+                return row != null && row.IsFolder ? 30 : 26;
+            };
+            _audioList.CanSelectItem = delegate(object item)
+            {
+                var row = item as AudioRow;
+                return row != null && !row.IsFolder;
+            };
+            _audioList.ItemClicked += delegate(object item)
+            {
+                var row = item as AudioRow;
+                if (row != null && row.IsFolder) ToggleAudioFolder(row.Folder);
+            };
+            // **点一下（单击）就放**。
+            //
+            // ⚠️ 这里踩过一个自作聪明的坑：原来挂在 ItemActivated（双击）上，同时
+            // RefreshAudioControls() 里有一句"把列表选中项同步回正在播放的那首"——
+            // 结果单击选中刚亮起来就被那句改回去了，双击时选中的已经不是想点的那首，
+            // 表现出来就是"列表点不动，只能用上/下一曲"。现在：
+            //   · 单击 = 播这一首；
+            //   · 程序自己改选中项时挂 _audioSuppressSelect，不再打回用户的操作。
+            _audioList.SelectedIndexChanged += delegate
+            {
+                if (_audioSuppressSelect) return;
+                var row = _audioList.SelectedItem as AudioRow;
+                if (row == null || row.Track == null) return;
+                var index = _audioTracks.IndexOf(row.Track);
+                if (index >= 0) PlayAudioTrack(index);
+            };
+            // 160 高（约 6 行）是刻意留的：这样面板打开时**一屏就能看到全部** ——
+            // 曲目、进度、按钮、音量、歌词都在，不用先滚一下。曲子多了列表内部自己滚。
+            AddRow(_audioList, 160);
+
+            // ---- 歌词 ----
+            _audioLyrics = new LyricView();
+            _audioLyrics.EmptyText = Loc.T("audio.lyrics.empty");   // 换语言后这里要跟着换
+            _audioLyrics.Visible = _audioLyricsVisible;
+            AddRow(_audioLyrics, 120);
+        }
+
+        /// <summary>
+        /// 曲目列表的一行：文件夹行（▶/▼ + 名字 + 曲目数）或曲目行。
+        ///
+        /// ⚠️ `ModernList` **没有默认绘制** —— 不设 `ItemDraw` 就是一片空白
+        /// （第一次就是这么盯着一个空列表发了半天呆）。
+        /// 列表项是 <see cref="AudioRow"/>，取曲目要走 `row.Track`。
+        /// </summary>
+        private void DrawAudioItem(ListItemDrawArgs args)
+        {
+            var row = args.Item as AudioRow;
+            if (row == null) return;
+
+            if (row.IsFolder)
+            {
+                DrawAudioFolderRow(args, row);
+                return;
+            }
+
+            var track = row.Track;
+            if (track == null) return;
+
+            var box = args.Bounds;
+            var isCurrent = _audioIndex >= 0 && _audioIndex < _audioTracks.Count
+                            && ReferenceEquals(_audioTracks[_audioIndex], track);
+
+            var background = args.Selected ? Theme.ButtonHover : (args.Hover ? Theme.Card : Theme.Track);
+            Ui.FillRounded(args.Graphics, box, 5f, background);
+
+            if (isCurrent)
+            {
+                using (var pen = new Pen(Theme.Accent, 2f))
+                using (var path = Theme.RoundedRect(
+                    new RectangleF(box.X + 1f, box.Y + 1f, box.Width - 2f, box.Height - 2f), 4f))
+                {
+                    args.Graphics.DrawPath(pen, path);
+                }
+            }
+
+            var unsupported = track.Playable.HasValue && !track.Playable.Value;
+            var color = unsupported ? Theme.TextDim : (isCurrent ? Theme.Link : Theme.Text);
+
+            var label = isCurrent ? ("▶ " + track.Title) : track.Title;
+            if (unsupported) label += Loc.T("audio.unsupported");
+
+            var indent = row.Depth * 14;
+            var left = new StringFormat();
+            left.LineAlignment = StringAlignment.Center;
+            left.Trimming = StringTrimming.EllipsisCharacter;
+            left.FormatFlags = StringFormatFlags.NoWrap;
+
+            using (var brush = new SolidBrush(color))
+            {
+                args.Graphics.DrawString(label, Ui.Font(8.5f), brush,
+                    new RectangleF(box.X + 10 + indent, box.Y,
+                        Math.Max(1, box.Width - 20 - indent), box.Height), left);
+            }
+        }
+
+        /// <summary>
+        /// 文件夹行：缩进 + 三角号 + 名字 + 曲目数（与「绘图」的素材树同一套画法）。
+        /// 三角号放在曲目缩略图该在的位置，一眼就知道这一行能点开。
+        /// </summary>
+        private void DrawAudioFolderRow(ListItemDrawArgs args, AudioRow row)
+        {
+            var box = args.Bounds;
+            var folder = row.Folder;
+            if (folder == null) return;
+
+            var background = args.Hover ? Theme.Card : Theme.Track;
+            Ui.FillRounded(args.Graphics, box, 5f, background);
+
+            var x = box.X + 10 + row.Depth * 14;
+            var cy = box.Y + box.Height / 2;
+            var expanded = _audioExpanded.Contains(folder.Relative);
+
+            Ui.PrepareShape(args.Graphics);
+            using (var path = new GraphicsPath())
+            {
+                if (expanded)
+                {
+                    path.AddLine(x, cy - 4, x + 9, cy - 4);
+                    path.AddLine(x + 9, cy - 4, x + 4.5f, cy + 3);
+                }
+                else
+                {
+                    path.AddLine(x, cy - 5, x + 8, cy);
+                    path.AddLine(x + 8, cy, x, cy + 5);
+                }
+                path.CloseFigure();
+                using (var brush = new SolidBrush(args.Hover ? Theme.Text : Theme.Link))
+                {
+                    args.Graphics.FillPath(brush, path);
+                }
+            }
+
+            Ui.PrepareText(args.Graphics);
+            using (var format = new StringFormat())
+            {
+                format.LineAlignment = StringAlignment.Center;
+                format.Trimming = StringTrimming.None;
+                format.FormatFlags = StringFormatFlags.NoWrap;
+
+                var nameRect = new Rectangle(x + 16, box.Y, Math.Max(0, box.Width - (x - box.X) - 22), box.Height);
+                using (var brush = new SolidBrush(Theme.Text))
+                {
+                    args.Graphics.DrawString(folder.Name, Ui.Font(9f, FontStyle.Bold),
+                        brush, nameRect, format);
+                }
+            }
+
+            var width = TextRenderer.MeasureText(folder.Name, Ui.Font(9f, FontStyle.Bold)).Width;
+            var countRect = new Rectangle(x + 22 + width, box.Y,
+                Math.Max(0, box.Width - (x - box.X) - width - 28), box.Height);
+            using (var format = new StringFormat())
+            {
+                format.LineAlignment = StringAlignment.Center;
+                format.Trimming = StringTrimming.None;
+                format.FormatFlags = StringFormatFlags.NoWrap;
+                using (var brush = new SolidBrush(Theme.TextDim))
+                {
+                    args.Graphics.DrawString(Loc.T("audio.track.count", folder.TotalCount),
+                        Ui.Font(7.5f), brush, countRect, format);
+                }
+            }
+        }
+
+        /// <summary>把树按展开状态打平成列表行（文件夹在前、曲目在后，与目录树一致）。</summary>
+        private void BuildAudioRows(AudioFolder folder, int depth)
+        {
+            if (folder == null) return;
+
+            foreach (var sub in folder.Folders)
+            {
+                var row = new AudioRow();
+                row.Folder = sub;
+                row.Depth = depth;
+                _audioRows.Add(row);
+
+                if (_audioExpanded.Contains(sub.Relative)) BuildAudioRows(sub, depth + 1);
+            }
+
+            foreach (var track in folder.Tracks)
+            {
+                var row = new AudioRow();
+                row.Track = track;
+                row.Depth = depth;
+                _audioRows.Add(row);
+            }
+        }
+
+        /// <summary>点文件夹行：展开 / 折叠，滚动位置尽量不动。</summary>
+        private void ToggleAudioFolder(AudioFolder folder)
+        {
+            if (folder == null) return;
+
+            if (_audioExpanded.Contains(folder.Relative)) _audioExpanded.Remove(folder.Relative);
+            else _audioExpanded.Add(folder.Relative);
+
+            var keep = _audioList == null ? 0 : _audioList.ScrollOffset;
+            RepopulateAudioList();
+            if (_audioList != null) _audioList.SetOffset(keep);
+        }
+
+        /// <summary>当前曲目在列表里是第几行（没展开/没选中返回 -1）。</summary>
+        private int RowIndexOfTrack(int trackIndex)
+        {
+            if (trackIndex < 0 || trackIndex >= _audioTracks.Count) return -1;
+            var track = _audioTracks[trackIndex];
+            for (var i = 0; i < _audioRows.Count; i++)
+            {
+                if (ReferenceEquals(_audioRows[i].Track, track)) return i;
+            }
+            return -1;
+        }
+
+        /// <summary>选中某一首（返回是否真的选中了，给自检用）。</summary>
+        private bool SelectAudioTrackRow(int trackIndex)
+        {
+            if (_audioList == null) return false;
+            var row = RowIndexOfTrack(trackIndex);
+            if (row < 0) return false;
+            _audioList.SelectedIndex = row;
+            return true;
+        }
+
+        /// <summary>列表内容宽度（决定要不要出横向滚动条）。</summary>
+        private int MeasureAudioRows()
+        {
+            var widest = 0;
+            foreach (var row in _audioRows)
+            {
+                var indent = 10 + row.Depth * 14 + 16;
+                var width = indent;
+                if (row.IsFolder)
+                {
+                    width += TextRenderer.MeasureText(row.Folder.Name, Ui.Font(9f, FontStyle.Bold)).Width;
+                    width += 10 + TextRenderer.MeasureText(
+                        Loc.T("audio.track.count", row.Folder.TotalCount), Ui.Font(7.5f)).Width;
+                }
+                else if (row.Track != null)
+                {
+                    width += TextRenderer.MeasureText(row.Track.Title, Ui.Font(8.5f)).Width;
+                }
+                width += 22;
+                if (width > widest) widest = width;
+            }
+            return widest;
+        }
+
+        /// <summary>把整棵音频树展开（截图 / 自检用；平时用户点一个开一个）。</summary>
+        internal void ExpandAllAudioForShot()
+        {
+            if (_audioRoot == null) return;
+            ExpandAllAudio(_audioRoot);
+        }
+
+        private void ExpandAllAudio(AudioFolder folder)
+        {
+            foreach (var sub in folder.Folders)
+            {
+                _audioExpanded.Add(sub.Relative);
+                ExpandAllAudio(sub);
+            }
+        }
+
+        /// <summary>面板每次打开都走这里：重新扫目录 + 把当前播放状态画上去。</summary>
+        private void RefreshAudioPanel()
+        {
+            if (!AudioEngine.Available) return;
+
+            RescanAudioLibrary();
+            RefreshAudioControls();
+            RefreshAudioLyrics();
+
+            if (_audioLyricButton != null)
+                _audioLyricButton.Text = _audioLyricsVisible ? Loc.T("audio.hidelyrics") : Loc.T("audio.showlyrics");
+            if (_audioLyrics != null)
+                _audioLyrics.Visible = _audioLyricsVisible;
+        }
+
+        /// <summary>
+        /// 扫 audio 目录。用"路径 + 大小"的指纹判断有没有变 ——
+        /// 没变就不动列表（列表重建会丢选中项，也会闪一下）。
+        /// </summary>
+        private void RescanAudioLibrary()
+        {
+            List<AudioTrack> scanned;
+            try
+            {
+                // 一次扫描，两份产物：树给界面画折叠菜单，扁平表给"上一曲/下一曲"
+                _audioRoot = AudioLibrary.ScanTree();
+                scanned = AudioLibrary.Flatten(_audioRoot);
+            }
+            catch (Exception ex) { AppLog.Write("扫描 audio 目录失败", ex); return; }
+
+            var signature = new StringBuilder();
+            foreach (var track in scanned)
+            {
+                signature.Append(track.Path).Append('|').Append(track.SizeBytes).Append(';');
+            }
+            var text = signature.ToString();
+
+            if (text == _audioSignature && scanned.Count == _audioTracks.Count)
+            {
+                if (_audioList != null && _audioList.Items.Count != _audioRows.Count) RepopulateAudioList();
+                return;
+            }
+
+            _audioSignature = text;
+
+            // 记住之前正在播的是哪一首（列表重建后按路径找回来）
+            var current = AudioEngine.CurrentPath;
+            _audioTracks.Clear();
+            _audioTracks.AddRange(scanned);
+
+            _audioIndex = -1;
+            for (var i = 0; i < _audioTracks.Count; i++)
+            {
+                if (string.Equals(_audioTracks[i].Path, current, StringComparison.OrdinalIgnoreCase))
+                {
+                    _audioIndex = i;
+                    break;
+                }
+            }
+
+            RepopulateAudioList();
+            StartAudioProbe();
+
+            SetAudioStatus(scanned.Count == 0
+                ? Loc.T("audio.no.tracks")
+                : Loc.T("audio.track.count", scanned.Count), false);
+        }
+
+        private void RepopulateAudioList()
+        {
+            if (_audioList == null) return;
+
+            _audioSuppressSelect = true;
+            _audioList.Items.Clear();
+            _audioRows.Clear();
+            BuildAudioRows(_audioRoot, 0);
+            foreach (var row in _audioRows) _audioList.Items.Add(row);
+            _audioList.SelectedIndex = RowIndexOfTrack(_audioIndex);
+            _audioSuppressSelect = false;
+
+            _audioList.ContentWidth = MeasureAudioRows();
+            _audioList.Invalidate();
+            AppLog.Write("音频树：" + _audioRows.Count + " 行，内容宽 " + _audioList.ContentWidth +
+                         "px，列表宽 " + _audioList.Width + "px，横向滚动=" +
+                         (_audioList.HorizontalScrollbarVisible ? "有" : "无"));
+        }
+
+        /// <summary>
+        /// 后台问原生层"这些文件能不能解"，好把 m4a/aac 这类标成"不支持此格式"。
+        /// 用**独立 decoder** 探测（见 native\audio_bridge.c），不会打断正在播的那首；
+        /// 放后台线程是因为一首要开一次文件，几十上百首会拖慢面板。
+        /// </summary>
+        private void StartAudioProbe()
+        {
+            if (_audioTracks.Count == 0) return;
+
+            var batch = new List<AudioTrack>(_audioTracks);
+            // ⚠️ 写全名：本文件用的是 Forms 的 Timer，`using System.Threading` 会让
+            //    Timer 变成二义（CS0104）—— 之前就是这么栽的。
+            var worker = new System.Threading.Thread(delegate ()
+            {
+                try { AudioLibrary.ProbeAll(batch, null); }
+                catch (Exception ex) { AppLog.Write("音频格式探测失败", ex); }
+
+                try
+                {
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        if (_audioList != null && !_audioList.IsDisposed) _audioList.Invalidate();
+                    });
+                }
+                catch { /* 窗体已经关了 */ }
+            });
+            worker.IsBackground = true;
+            worker.Name = "audio-probe";
+            worker.Start();
+        }
+
+        /// <summary>把"当前曲目 / 按钮文字 / 音量"按实际状态刷一遍。</summary>
+        private void RefreshAudioControls()
+        {
+            if (_audioTitle != null)
+            {
+                _audioTitle.Text = (_audioIndex >= 0 && _audioIndex < _audioTracks.Count)
+                    ? _audioTracks[_audioIndex].Display
+                    : Loc.T("audio.none");
+            }
+            if (_audioPlayButton != null)
+                _audioPlayButton.Text = AudioEngine.IsPlaying ? Loc.T("audio.pause") : Loc.T("audio.play");
+            if (_audioModeButton != null)
+                _audioModeButton.Text = AudioModeText();
+            var wantedRow = RowIndexOfTrack(_audioIndex);
+            if (_audioList != null && _audioList.SelectedIndex != wantedRow)
+            {
+                // ⚠️ 必须挂抑制标志：这个赋值会回调 SelectedIndexChanged，
+                // 而那里面是"点了就播"——不挂的话每次刷按钮都会重放一遍当前曲目。
+                _audioSuppressSelect = true;
+                _audioList.SelectedIndex = wantedRow;
+                _audioSuppressSelect = false;
+            }
+        }
+
+        // ------------------------------------------------------------ 播放控制
+
+        private string AudioModeText()
+        {
+            switch (_audioMode)
+            {
+                case AudioPlayMode.Sequential: return Loc.T("audio.mode.sequence");
+                case AudioPlayMode.Shuffle: return Loc.T("audio.mode.shuffle");
+                default: return Loc.T("audio.mode.loop");
+            }
+        }
+
+        private void CycleAudioMode()
+        {
+            switch (_audioMode)
+            {
+                case AudioPlayMode.RepeatOne: _audioMode = AudioPlayMode.Sequential; break;
+                case AudioPlayMode.Sequential: _audioMode = AudioPlayMode.Shuffle; break;
+                default: _audioMode = AudioPlayMode.RepeatOne; break;
+            }
+            RefreshAudioControls();
+            SetAudioStatus(Loc.T("audio.mode.current", AudioModeText()), false);
+        }
+
+        private void ToggleAudioLyrics()
+        {
+            _audioLyricsVisible = !_audioLyricsVisible;
+            if (_audioLyrics != null) _audioLyrics.Visible = _audioLyricsVisible;
+            if (_audioLyricButton != null)
+                _audioLyricButton.Text = _audioLyricsVisible ? Loc.T("audio.hidelyrics") : Loc.T("audio.showlyrics");
+            if (_audioLyricsVisible) RefreshAudioLyrics();
+        }
+
+        /// <summary>播第 index 首（打开失败只提示、不弹框 —— DM 正在投屏，别打断他）。</summary>
+        private void PlayAudioTrack(int index)
+        {
+            if (index < 0 || index >= _audioTracks.Count) return;
+
+            var track = _audioTracks[index];
+            string error;
+
+            if (!AudioEngine.Open(track.Path, out error))
+            {
+                _audioIndex = index;
+                AppLog.Write("音频打不开：" + track.Path + " -> " + error);
+                SetAudioStatus(Loc.T("audio.open.fail", error), true);
+                RefreshAudioControls();
+                return;
+            }
+
+            _audioIndex = index;
+            _audioLrc = Lrc.Load(track.Path);
+            AudioEngine.SetVolume(_audioVolume == null ? AudioEngine.Volume : _audioVolume.Value / 100f);
+            AudioEngine.Play();
+            _audioWasPlaying = true;
+
+            AppLog.Write("开始播放：" + track.Path +
+                         (_audioLrc == null ? "（无歌词）" : "（歌词 " + _audioLrc.Lines.Count + " 句）"));
+            SetAudioStatus(_audioLrc == null
+                ? Loc.T("audio.lyrics.missing") : Loc.T("audio.lyrics.loaded"), false);
+            RefreshAudioControls();
+            RefreshAudioLyrics();
+        }
+
+        private void ToggleAudioPlay()
+        {
+            if (_audioTracks.Count == 0)
+            {
+                RescanAudioLibrary();
+                if (_audioTracks.Count == 0) { SetAudioStatus(Loc.T("audio.no.tracks"), true); return; }
+            }
+
+            if (AudioEngine.CurrentPath.Length == 0)
+            {
+                // 还没选过曲子：从第一首（或列表里选中的那首）开始
+                var selected = _audioList == null ? null : _audioList.SelectedItem as AudioRow;
+                var index = (selected != null && selected.Track != null)
+                    ? _audioTracks.IndexOf(selected.Track)
+                    : 0;
+                if (index < 0) index = 0;
+                PlayAudioTrack(index);
+                return;
+            }
+
+            if (AudioEngine.IsPlaying)
+            {
+                AudioEngine.Pause();
+                _audioWasPlaying = false;
+            }
+            else
+            {
+                // 播完之后再点"播放" = 从头来
+                if (AudioEngine.AtEnd) AudioEngine.Seek(0f);
+                AudioEngine.Play();
+                _audioWasPlaying = true;
+            }
+            RefreshAudioControls();
+        }
+
+        /// <summary>上一曲 / 下一曲。随机模式下"上一曲"也是随机（省得记播放历史）。</summary>
+        private void AudioSkip(int step)
+        {
+            if (_audioTracks.Count == 0)
+            {
+                RescanAudioLibrary();
+                if (_audioTracks.Count == 0) { SetAudioStatus(Loc.T("audio.no.tracks"), true); return; }
+            }
+
+            if (_audioIndex < 0) { PlayAudioTrack(0); return; }
+
+            int next;
+            if (_audioMode == AudioPlayMode.Shuffle && _audioTracks.Count > 1)
+            {
+                var random = new Random(unchecked(Environment.TickCount * 31 + _audioIndex));
+                do { next = random.Next(_audioTracks.Count); } while (next == _audioIndex);
+            }
+            else
+            {
+                next = _audioIndex + step;
+                if (next < 0) next = _audioTracks.Count - 1;
+                if (next >= _audioTracks.Count) next = 0;
+            }
+
+            PlayAudioTrack(next);
+        }
+
+        /// <summary>
+        /// 一首放完了：单曲循环就重头再来，顺序 / 随机就切下一首。
+        ///
+        /// 这里**没有**用原生层的 looping 标志：三种模式统一在这一处判断，
+        /// 行为好推理（原生 looping 只在"单曲循环"时生效，另外两种又得另写一套）。
+        /// </summary>
+        private void OnAudioTrackFinished()
+        {
+            _audioWasPlaying = false;
+
+            if (_audioMode == AudioPlayMode.RepeatOne)
+            {
+                AudioEngine.Seek(0f);
+                AudioEngine.Play();
+                _audioWasPlaying = true;
+                return;
+            }
+
+            AudioSkip(1);
+        }
+
+        private void OnAudioSeekDragged()
+        {
+            if (_audioSuppressSeek) return;      // 是我们自己刷的，不是用户拖的
+            var length = AudioEngine.Length;
+            if (length <= 0.01f) return;
+
+            // 拖动会连发几十次，每次都 seek 会把流式解码器打断得很碎
+            // （实测量得到明显卡顿），所以只记目标，真正 seek 交给下一个 tick。
+            _audioPendingSeek = _audioSeek.Value / 1000f * length;
+        }
+
+        private void OnAudioVolumeChanged()
+        {
+            if (_audioVolume == null) return;
+            AudioEngine.SetVolume(_audioVolume.Value / 100f);
+        }
+
+        /// <summary>
+        /// 250ms 一拍：推进度、更歌词、认"刚播完"。**跟面板开关无关** ——
+        /// 面板关着也要跑，否则曲子放完就没人切下一首了。
+        /// </summary>
+        private void AudioTick()
+        {
+            if (!AudioEngine.Available) return;
+
+            if (_audioPendingSeek >= 0f)
+            {
+                AudioEngine.Seek(_audioPendingSeek);
+                _audioPendingSeek = -1f;
+            }
+
+            var playing = AudioEngine.IsPlaying;
+            if (_audioWasPlaying && !playing && AudioEngine.AtEnd)
+            {
+                OnAudioTrackFinished();
+                return;
+            }
+            _audioWasPlaying = playing;
+
+            var panelVisible = _panelOpen == PanelKind.Audio && _panelHost != null && _panelHost.Visible;
+            if (!panelVisible) return;
+
+            var length = AudioEngine.Length;
+            var position = AudioEngine.Position;
+
+            if (_audioSeek != null && length > 0.01f)
+            {
+                var percent = (int)Math.Round(position / length * 1000.0);
+                if (percent < 0) percent = 0;
+                if (percent > 1000) percent = 1000;
+
+                _audioSuppressSeek = true;
+                _audioSeek.Value = percent;
+                _audioSuppressSeek = false;
+            }
+
+            if (_audioTime != null)
+                _audioTime.Text = AudioFormatTime(position) + " / " + AudioFormatTime(length);
+
+            if (_audioPlayButton != null)
+            {
+                var text = playing ? Loc.T("audio.pause") : Loc.T("audio.play");
+                if (_audioPlayButton.Text != text) _audioPlayButton.Text = text;
+            }
+
+            RefreshAudioLyrics();
+        }
+
+        private void RefreshAudioLyrics()
+        {
+            if (_audioLyrics == null || _audioLyrics.IsDisposed) return;
+
+            var lrc = _audioLrc;
+            if (!ReferenceEquals(_audioLyrics.Lyrics, lrc))
+            {
+                _audioLyrics.Lyrics = lrc;
+                _audioLyrics.Index = -1;
+            }
+            if (lrc == null || lrc.IsEmpty) return;
+
+            var index = lrc.IndexAt(AudioEngine.Position);
+            if (index != _audioLyrics.Index)
+            {
+                _audioLyrics.Index = index;
+                if (_audioLyrics.Visible) _audioLyrics.Invalidate();
+            }
+        }
+
+        private static string AudioFormatTime(float seconds)
+        {
+            if (float.IsNaN(seconds) || seconds < 0f) seconds = 0f;
+            var total = (int)seconds;
+            return (total / 60).ToString() + ":" + (total % 60).ToString("00");
+        }
+
+        private void SetAudioStatus(string text, bool error)
+        {
+            if (_audioStatus == null) return;
+            _audioStatus.Text = text ?? string.Empty;
+            _audioStatus.ForeColor = error ? Theme.Error : Theme.Link;
+        }
+
+        /// <summary>侧栏那 7 个按钮的文字。顺序必须和 OnSidebarItemClicked 的 case 一一对应。</summary>
+        private static string[] SidebarLabels()
+        {
+            return new[]
+            {
+                Loc.T("sidebar.expand"),
+                Loc.T("sidebar.map"),
+                Loc.T("sidebar.network"),
+                Loc.T("sidebar.draw"),
+                Loc.T("sidebar.audio"),
+                Loc.T("sidebar.fullscreen"),
+                Loc.T("sidebar.about")
+            };
+        }
+
+        // ============================================================
+        //  界面语言
+        // ============================================================
+
+        private ModernDropDown _langCombo;
+        private readonly List<LangInfo> _langOrder = new List<LangInfo>();
+        private bool _closeConfirmed;
+
+        /// <summary>
+        /// 下拉框的候选顺序：**系统语言（推荐）永远第一**，其余按英文名首字母排序。
+        /// 同时把顺序记进 _langOrder，选中索引 → 语言代码的换算靠它。
+        /// </summary>
+        private List<string> LanguageChoices()
+        {
+            _langOrder.Clear();
+            var recommended = Loc.RecommendedLanguage;
+
+            foreach (var lang in Loc.Languages)
+            {
+                if (string.Equals(lang.Code, recommended, StringComparison.OrdinalIgnoreCase))
+                    _langOrder.Add(lang);
+            }
+
+            var rest = new List<LangInfo>();
+            foreach (var lang in Loc.Languages)
+            {
+                if (!string.Equals(lang.Code, recommended, StringComparison.OrdinalIgnoreCase))
+                    rest.Add(lang);
+            }
+            rest.Sort(delegate (LangInfo a, LangInfo b)
+            {
+                return string.Compare(a.EnglishName, b.EnglishName, StringComparison.OrdinalIgnoreCase);
+            });
+            _langOrder.AddRange(rest);
+
+            var items = new List<string>();
+            for (var i = 0; i < _langOrder.Count; i++)
+            {
+                var text = _langOrder[i].NativeName;
+                // 「（推荐）」用**这门语言自己**的写法：中文括号 / 英文括号
+                if (i == 0) text += Loc.TextIn(_langOrder[i].Code, "lang.recommended");
+                items.Add(text);
+            }
+            return items;
+        }
+
+        private int CurrentLanguageIndex()
+        {
+            for (var i = 0; i < _langOrder.Count; i++)
+            {
+                if (string.Equals(_langOrder[i].Code, Loc.Language, StringComparison.OrdinalIgnoreCase))
+                    return i;
+            }
+            return 0;
+        }
+
+        /// <summary>
+        /// 「应用」：切语言 → 重建界面 → 弹确认框（15 秒或取消就回退）。
+        ///
+        /// 先切再问是刻意的 —— 用户能当场看到切换后的效果，而不是对着一串语言名猜。
+        /// </summary>
+        private void ApplySelectedLanguage()
+        {
+            if (_langCombo == null || _langCombo.SelectedIndex < 0 ||
+                _langCombo.SelectedIndex >= _langOrder.Count) return;
+
+            var oldCode = Loc.Language;
+            var newCode = _langOrder[_langCombo.SelectedIndex].Code;
+            if (string.Equals(oldCode, newCode, StringComparison.OrdinalIgnoreCase)) return;
+
+            var oldName = Loc.DisplayName(oldCode);
+            var newName = Loc.DisplayName(newCode);
+
+            Loc.SetLanguage(newCode, false);
+            RebuildUiForLanguage(false);   // 先只换侧栏与标题；关于面板等确认后一起重建
+
+            // 文案里不再写死"15 秒"：秒数由倒计时行每秒刷新（见 ConfirmDialog.UpdateCountdown）。
+            var keep = ConfirmDialog.AskWithCountdown(this,
+                Loc.T("lang.changed.title"),
+                Loc.T("lang.changed.text", newName, oldName),
+                Loc.T("lang.keep"),
+                Loc.T("lang.revert"),
+                15,
+                Loc.T("lang.countdown"),
+                oldName);
+
+            if (keep) Loc.SetLanguage(newCode, true);
+            else Loc.SetLanguage(oldCode, false);
+
+            RebuildUiForLanguage(true);
+        }
+
+        /// <summary>
+        /// 换语言之后重建界面：侧栏文字、窗口标题、所有抽屉面板（缓存的是旧语言的控件，
+        /// 必须丢掉重建）。<paramref name="reopenAbout"/> = 重建完把关于面板再打开。
+        /// </summary>
+        private void RebuildUiForLanguage(bool reopenAbout)
+        {
+            Text = Loc.T("app.title");
+            if (_sidebar != null) _sidebar.SetLabels(SidebarLabels());
+            // 绘图面板是常驻控件（不像抽屉面板那样关掉就丢），必须显式重建才换词。
+            if (_drawPanel != null) _drawPanel.ReloadLanguage();
+            Invalidate();
+
+            var wasAbout = reopenAbout;
+            if (_panelOpen != PanelKind.None) CloseAll();
+
+            var timer = new Timer();
+            timer.Interval = 240;      // 等 CloseAll 的淡出（190ms）收尾
+            timer.Tick += delegate
+            {
+                timer.Stop();
+                timer.Dispose();
+
+                DisposePanelCache();
+                if (wasAbout) OpenPanel(PanelKind.About);
+            };
+            timer.Start();
+        }
+
         private void BuildAboutPanel()
         {
-            AddTitle("关于");
+            AddTitle(Loc.T("about.title"));
             AddSeparator();
 
             // 头像。用 PictureBox + 椭圆 Region 做圆形裁切 —— GDI+ 画圆角图片
@@ -3472,13 +4549,13 @@ namespace TrpgMaps
             name.TextAlign = ContentAlignment.MiddleCenter;
             AddRow(name, 26);
 
-            var tagline = MakeLabel("跑团地图投屏工具 · Win7 / 32 位兼容版", 8.5f, Theme.TextDim);
+            var tagline = MakeLabel(Loc.T("about.tagline"), 8.5f, Theme.TextDim);
             tagline.TextAlign = ContentAlignment.MiddleCenter;
             AddRow(tagline, 22);
 
             AddSeparator();
 
-            AddRow(MakeLabel("作者", 9f, Theme.Text), 20);
+            AddRow(MakeLabel(Loc.T("about.author"), 9f, Theme.Text), 20);
             var author = MakeLabel(AppInfo.Author, 10f, Color.White);
             AddRow(author, 24);
 
@@ -3487,28 +4564,51 @@ namespace TrpgMaps
             AddLinkRow(AppInfo.GitHubHome, AppInfo.GitHubHome);
             AddLinkRow(AppInfo.GiteeHome, AppInfo.GiteeHome);
 
-            AddRow(MakeLabel("源码仓库", 9f, Theme.Text), 20);
+            AddRow(MakeLabel(Loc.T("about.repo"), 9f, Theme.Text), 20);
             AddLinkRow(AppInfo.GitHubRepo, AppInfo.GitHubRepo);
 
             AddSeparator();
 
-            AddRow(MakeLabel("版本与更新", 9f, Theme.Text), 20);
+            // ---- 界面语言 ----
+            //
+            // 第一项永远是"系统语言 +（推荐）"，其余按英文名首字母排序。
+            // 点「应用」后**先切换、再弹确认框**：让用户当场看到新语言的样子；
+            // 不确认（15 秒超时或点取消）就回退。
+            AddRow(MakeLabel(Loc.T("lang.title"), 9f, Theme.Text), 20);
+
+            _langCombo = new ModernDropDown();
+            _langCombo.SetItems(LanguageChoices(), CurrentLanguageIndex());
+            _langCombo.AutoSize = false;
+            _langCombo.Width = _contentWidth;
+            _langCombo.Height = 30;
+            AddRow(_langCombo, 30);
+
+            var langHint = MakeLabel(Loc.T("lang.hint"), 8f, Theme.TextDim);
+            AddRow(langHint, 32);
+
+            var applyLang = MakeButton(Loc.T("lang.apply"), false, true);
+            applyLang.Click += delegate { ApplySelectedLanguage(); };
+            AddRow(applyLang, 30, 96);
+
+            AddSeparator();
+
+            AddRow(MakeLabel(Loc.T("about.version"), 9f, Theme.Text), 20);
             _updateStatus = MakeLabel(string.Empty, 8.5f, Theme.TextDim);
             AddRow(_updateStatus, 40);
             RefreshUpdateStatusLine();
 
-            var check = MakeButton("检查更新", false, true);
+            var check = MakeButton(Loc.T("about.check"), false, true);
             check.Click += delegate { CheckForUpdates(false); };
             AddRow(check, 30, 120);
 
             AddSeparator();
 
             var installed = AppRegistry.IsInstalledAt(AppEnv.Root);
-            var channel = MakeLabel(installed ? "当前为安装版" : "当前为便携版", 8.5f,
+            var channel = MakeLabel(installed ? Loc.T("about.installed") : Loc.T("about.portable"), 8.5f,
                 installed ? Theme.Success : Theme.TextDim);
             AddRow(channel, 20);
 
-            var legal = MakeLabel("Copyright © " + AppInfo.Author + "　保留所有权利。", 8f, Theme.TextDim);
+            var legal = MakeLabel(Loc.T("about.copyright", AppInfo.Author), 8f, Theme.TextDim);
             AddRow(legal, 20);
         }
 
@@ -3545,14 +4645,13 @@ namespace TrpgMaps
 
             if (_updateChecking)
             {
-                _updateStatus.Text = "正在检查更新…";
+                _updateStatus.Text = Loc.T("update.checking");
                 return;
             }
 
             var skipped = AppRegistry.GetSkippedVersion();
-            var text = "当前版本 " + AppInfo.VersionText + "\r\n";
-            text += "更新源：Gitee 优先，失败自动转 GitHub";
-            if (!string.IsNullOrEmpty(skipped)) text += "\r\n已忽略版本：v" + skipped;
+            var text = Loc.T("update.version.line", AppInfo.VersionText);
+            if (!string.IsNullOrEmpty(skipped)) text += Loc.T("update.skipped.line", skipped);
 
             _updateStatus.Text = text;
         }
@@ -3614,15 +4713,13 @@ namespace TrpgMaps
             {
                 if (_updateStatus != null)
                 {
-                    _updateStatus.Text = "检查更新失败。\r\n" + Trim(result.Error, 120);
+                    _updateStatus.Text = Loc.T("update.check.failed.line", Trim(result.Error, 120));
                 }
 
                 if (!silent)
                 {
-                    UpdateDialog.ShowWarning(this, "检查更新失败",
-                        "没能连上更新服务器。\r\n\r\n" + Trim(result.Error, 320) +
-                        "\r\n\r\n提示：老版本 Windows 7 如果从没更新过根证书，会连不上 HTTPS 站点，" +
-                        "装一次 Windows Update 里的根证书更新即可。也可以直接到仓库的 Releases 页手动下载。");
+                    UpdateDialog.ShowWarning(this, Loc.T("update.check.failed.title"),
+                        Loc.T("update.check.failed.text", Trim(result.Error, 320)));
                 }
                 return;
             }
@@ -3633,21 +4730,22 @@ namespace TrpgMaps
             {
                 if (_updateStatus != null)
                 {
-                    _updateStatus.Text = "已是最新版本（" + AppInfo.VersionText + "）\r\n" +
-                                         "检查源：" + SourceName(result.Source);
+                    _updateStatus.Text = Loc.T("update.latest.line",
+                        AppInfo.VersionText, SourceName(result.Source));
                 }
 
                 if (!silent)
                 {
-                    UpdateDialog.ShowInfo(this, "已是最新版本",
-                        "当前 " + AppInfo.VersionText + " 已经是仓库里的最新版本了。");
+                    UpdateDialog.ShowInfo(this, Loc.T("update.latest.title"),
+                        Loc.T("update.latest.text", AppInfo.VersionText));
                 }
                 return;
             }
 
             if (_updateStatus != null)
             {
-                _updateStatus.Text = "发现新版本 v" + manifest.Version + "\r\n检查源：" + SourceName(result.Source);
+                _updateStatus.Text = Loc.T("update.found.line",
+                    manifest.Version, SourceName(result.Source));
             }
 
             if (NoPrompts) return;      // 自动化测试：查到也不弹
@@ -3682,7 +4780,7 @@ namespace TrpgMaps
             var downloaded = false;
             var error = string.Empty;
 
-            using (var busy = new BusyDialog("正在下载更新", "正在连接下载升级包，请稍候…",
+            using (var busy = new BusyDialog(Loc.T("update.busy.title"), Loc.T("update.busy.text"),
                        delegate (BusyDialog dialog)
                        {
                            string source;
@@ -3690,12 +4788,12 @@ namespace TrpgMaps
                            downloaded = UpdateCheck.DownloadUpdate(manifest, zip, out source, out message);
                            if (downloaded)
                            {
-                               dialog.SetStatus("下载完成（来自 " + SourceName(source) + "），准备应用更新…");
+                               dialog.SetStatus(Loc.T("update.busy.done", SourceName(source)));
                            }
                            else
                            {
                                error = message;
-                               dialog.SetStatus("下载失败。");
+                               dialog.SetStatus(Loc.T("update.busy.failed"));
                            }
                        }))
             {
@@ -3704,9 +4802,8 @@ namespace TrpgMaps
 
             if (!downloaded)
             {
-                UpdateDialog.ShowWarning(this, "更新失败",
-                    "升级包下载失败。\r\n\r\n" + Trim(error, 320) +
-                    "\r\n\r\n也可以到仓库的 Releases 页手动下载安装包。");
+                UpdateDialog.ShowWarning(this, Loc.T("update.failed.title"),
+                    Loc.T("update.failed.download", Trim(error, 320)));
                 return;
             }
 
@@ -3716,7 +4813,7 @@ namespace TrpgMaps
             string stageError;
             if (!UpdateCheck.StageAndLaunch(zip, installed, out stageError))
             {
-                UpdateDialog.ShowWarning(this, "更新失败", stageError);
+                UpdateDialog.ShowWarning(this, Loc.T("update.failed.title"), stageError);
                 return;
             }
 
@@ -3730,7 +4827,7 @@ namespace TrpgMaps
         {
             if (string.Equals(source, "gitee", StringComparison.OrdinalIgnoreCase)) return "Gitee";
             if (string.Equals(source, "github", StringComparison.OrdinalIgnoreCase)) return "GitHub";
-            return string.IsNullOrEmpty(source) ? "未知" : source;
+            return string.IsNullOrEmpty(source) ? Loc.T("update.source.unknown") : source;
         }
 
         private static string Trim(string text, int max)

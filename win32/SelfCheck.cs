@@ -179,6 +179,30 @@ namespace TrpgMaps
             ok &= CheckDrawing(log, outDir);
             log.Add("");
 
+            // ---------------- 素材选中 → 落到格子 ----------------
+
+            log.Add("--- asset selection reaches the grid (manual + brush both need this) ---");
+            ok &= CheckAssetSelection(log);
+            log.Add("");
+
+            // ---------------- 界面语言词表 ----------------
+
+            log.Add("--- i18n: every key translated in every language ---");
+            ok &= CheckI18n(log);
+            log.Add("");
+
+            // ---------------- 语言弹窗的倒计时 ----------------
+
+            log.Add("--- language dialog: the countdown must actually tick ---");
+            ok &= CheckCountdown(log);
+            log.Add("");
+
+            // ---------------- 音频树 ----------------
+
+            log.Add("--- audio library: tree vs flat list ---");
+            ok &= CheckAudioLibrary(log);
+            log.Add("");
+
             // ---------------- 房间号 / 房间密码 / 退出房间 ----------------
 
             log.Add("--- room: 8-digit number, password, leave ---");
@@ -970,6 +994,199 @@ namespace TrpgMaps
         }
 
         /// <summary>
+        /// 素材"选中 → 落到格子"整条链。
+        ///
+        /// v1.0.3 的真实回归：素材列表改成多级菜单之后，列表项从 <c>TerrainAsset</c>
+        /// 换成了 <c>AssetRow</c>，而 <c>CommitAssetSelection</c> 还在写
+        /// <c>SelectedItem as TerrainAsset</c> —— 永远拿到 null，于是面板上"看着选中了"，
+        /// 实际 <c>_selectedFile</c> 一次都没写过：手动和笔刷都画不出任何东西。
+        ///
+        /// 所以这里不看中间字段，直接走完：选中第一张 → 取到素材 → 真往数据层落两格
+        /// → 回读"这张素材现在占了几格"。任何一环断了都会失败。
+        /// </summary>
+        private static bool CheckAssetSelection(List<string> log)
+        {
+            var ok = true;
+            MapCanvas canvas = null;
+            DrawPanel panel = null;
+
+            try
+            {
+                canvas = new MapCanvas();
+                canvas.Size = new Size(CanvasWidth, CanvasHeight);
+
+                var catalog = new TerrainCatalog();
+                var temp = Path.Combine(Path.GetTempPath(),
+                    "trpgmaps-selfcheck-drawing-" + Environment.TickCount + ".json");
+                var store = new DrawingStore(temp);
+                var cache = new TerrainImageCache(catalog);
+
+                try
+                {
+                    panel = new DrawPanel(canvas, store, catalog, cache);
+                    panel.SetKind(DrawKind.Entity);
+                    // 实体目录是按职业分文件夹的，图片都在文件夹里 —— 不展开就一行素材都没有
+                    panel.ExpandAllForShot();
+                    panel.SelectFirstAssetForShot();
+
+                    var asset = panel.SelectedAsset;
+                    log.Add("  selected : " +
+                            (asset == null ? "(none)" : asset.Kind + "/" + asset.Relative));
+
+                    if (asset == null)
+                    {
+                        log.Add("  pick the first asset                         -> FAIL");
+                        ok = false;
+                    }
+                    else
+                    {
+                        var cells = new List<GridCell>();
+                        cells.Add(new GridCell(3, 4));
+                        cells.Add(new GridCell(4, 4));
+
+                        var changed = store.Paint(asset.Kind, cells, asset.Relative);
+                        var counted = store.CountAsset(asset.Kind, asset.Relative);
+                        log.Add("  paint 2 cells : changed=" + changed + " counted=" + counted);
+
+                        var landed = changed >= 1 && counted >= 2;
+                        log.Add("  the asset really lands on cells               -> " +
+                                (landed ? "OK" : "FAIL"));
+                        ok &= landed;
+                    }
+                }
+                finally
+                {
+                    if (panel != null) panel.Dispose();
+                    if (cache != null) cache.Dispose();
+                    if (File.Exists(temp)) { try { File.Delete(temp); } catch { } }
+                }
+            }
+            catch (Exception ex)
+            {
+                AppLog.Write("素材选中自检失败", ex);
+                log.Add("  FAILED : " + ex.Message);
+                ok = false;
+            }
+            finally
+            {
+                if (canvas != null) canvas.Dispose();
+            }
+
+            return ok;
+        }
+
+        /// <summary>
+        /// 语言切换弹窗的倒计时。
+        ///
+        /// v1.0.3 的坑：`ConfirmDialog` 里的 `Timer` 建好了、`Tick` 也挂了，
+        /// 唯独**没有 `Start()`** —— 那行字从打开到关闭一直停在「15 秒」，
+        /// 到点也不会自动回退。用户看到的就是"15 秒写死了"。
+        /// 这里让它真跑 2.5 秒，只认"文字变了"。
+        /// </summary>
+        private static bool CheckCountdown(List<string> log)
+        {
+            string first;
+            string later;
+            var moved = ConfirmDialog.ProbeCountdown(5, out first, out later);
+
+            log.Add("  first : " + first);
+            log.Add("  2.5s  : " + later);
+            log.Add("  the countdown text decreases over time        -> " + (moved ? "OK" : "FAIL"));
+            return moved;
+        }
+
+        /// <summary>
+        /// 音频库：目录树与扁平播放列表必须**一一对应**。
+        ///
+        /// 「上一曲 / 下一曲」走扁平表，界面画的是折叠树 —— 两者对不上时的症状是
+        /// "列表里有 8 首，下一曲只循环 3 首"这种很难查的问题。这里只数数量、
+        /// 并检查扁平表里没有重复项。
+        /// </summary>
+        private static bool CheckAudioLibrary(List<string> log)
+        {
+            AudioFolder root;
+            List<AudioTrack> flat;
+
+            try
+            {
+                root = AudioLibrary.ScanTree();
+                flat = AudioLibrary.Flatten(root);
+            }
+            catch (Exception ex)
+            {
+                AppLog.Write("音频树自检失败", ex);
+                log.Add("  FAILED : " + ex.Message);
+                return false;
+            }
+
+            var treeCount = CountTracks(root);
+            var folders = CountFolders(root);
+            log.Add("  folders : " + folders);
+            log.Add("  tracks  : tree=" + treeCount + "  flat=" + flat.Count);
+
+            var paths = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            var duplicate = 0;
+            foreach (var track in flat)
+            {
+                if (paths.ContainsKey(track.Path)) duplicate++;
+                else paths[track.Path] = true;
+            }
+
+            var same = treeCount == flat.Count;
+            log.Add("  tree and flat list agree                     -> " + (same ? "OK" : "FAIL"));
+            log.Add("  no duplicate track in the flat list          -> " +
+                    (duplicate == 0 ? "OK" : "FAIL (" + duplicate + ")"));
+            return same && duplicate == 0;
+        }
+
+        private static int CountTracks(AudioFolder node)
+        {
+            var total = node.Tracks.Count;
+            foreach (var folder in node.Folders) total += CountTracks(folder);
+            return total;
+        }
+
+        private static int CountFolders(AudioFolder node)
+        {
+            var total = node.Folders.Count;
+            foreach (var folder in node.Folders) total += CountFolders(folder);
+            return total;
+        }
+
+        /// <summary>
+        /// 词表完整性：内置的每一条都要有两种语言的译文。
+        ///
+        /// 这条抓的是"加键时漏翻"——空译文会悄悄退回另一门语言，
+        /// 界面上看起来就是"切到英文还是中文"。
+        /// （真正把硬编码搬进词表这件事，由 scripts\check_i18n.py 在构建时把关。）
+        /// </summary>
+        private static bool CheckI18n(List<string> log)
+        {
+            var missing = new List<string>();
+
+            for (var i = 0; i < Loc.DefaultKeyCount; i++)
+            {
+                var key = Loc.DefaultKeyAt(i);
+                foreach (var lang in Loc.Languages)
+                {
+                    if (string.IsNullOrEmpty(Loc.DefaultValueAt(i, lang.Code)))
+                    {
+                        missing.Add(key + " [" + lang.Code + "]");
+                    }
+                }
+            }
+
+            log.Add("  keys      : " + Loc.DefaultKeyCount);
+            log.Add("  languages : " + Loc.Languages.Length);
+            log.Add("  untranslated : " + missing.Count +
+                    (missing.Count == 0 ? "" : " -> " + string.Join(", ", missing.ToArray())));
+
+            var ok = missing.Count == 0;
+            log.Add("  every key translated                          -> " + (ok ? "OK" : "FAIL"));
+            return ok;
+        }
+
+        /// <summary>
         /// 素材（绘图贴图）预览缩略图自检。
         ///
         /// 第十七轮踩的坑：底图换成 webp 之后，**底图缩略图改了、素材缩略图漏了**。
@@ -1629,7 +1846,7 @@ namespace TrpgMaps
                 {
                     new GridCell(cellX, cellY),
                     new GridCell(farX, cellY)
-                }, asset.File);
+                }, asset.Relative);
 
                 using (var cache = new TerrainImageCache(catalog))
                 using (var canvas = new MapCanvas())
@@ -2324,6 +2541,165 @@ namespace TrpgMaps
                     (lowOk ? "-> OK" : "-> FAIL"));
             ok &= lowOk;
 
+            // ---- 音频播放器：原生层（TrpgAudio.dll）+ 歌词解析 ----
+            // 全部用临时文件，所以自检**不要求**用户先在 audio\ 里放音乐。
+            var audioDir = Path.Combine(Path.GetTempPath(), "trpgm-audio-selfcheck");
+            try
+            {
+                if (Directory.Exists(audioDir)) Directory.Delete(audioDir, true);
+                Directory.CreateDirectory(audioDir);
+            }
+            catch
+            {
+                // 临时目录都建不出来的话，下面那几条自己会 FAIL
+            }
+
+            var engineOk = AudioEngine.Available;
+            log.Add("  audio engine loaded (" + AudioEngine.Version + ")                              " +
+                    (engineOk ? "-> OK" : "-> SKIP: " + AudioEngine.UnavailableReason));
+
+            if (engineOk)
+            {
+                var tonePath = Path.Combine(audioDir, "tone.wav");
+                WriteToneWav(tonePath, 1.0);
+
+                var decodable = AudioEngine.CanDecode(tonePath);
+                log.Add("  probe: a generated wav decodes                                        " +
+                        (decodable ? "-> OK" : "-> FAIL"));
+                ok &= decodable;
+
+                string openError;
+                var opened = AudioEngine.Open(tonePath, out openError);
+                var length = AudioEngine.Length;
+                var lengthOk = opened && Math.Abs(length - 1.0f) < 0.25f;
+                log.Add("  open + length = " + length.ToString("F2") + "s (expect ~1.00)                          " +
+                        (lengthOk ? "-> OK" : "-> FAIL: " + openError));
+                ok &= lengthOk;
+
+                AudioEngine.SetVolume(0f);              // 静音：无人值守时别突然出声
+                var playing = AudioEngine.Play();
+                System.Threading.Thread.Sleep(300);
+                var moved = AudioEngine.Position;
+                AudioEngine.Pause();
+                var movedOk = playing && moved > 0.05f;
+                log.Add("  playback advances (" + moved.ToString("F2") + "s after 300ms)                          " +
+                        (movedOk ? "-> OK" : "-> FAIL"));
+                ok &= movedOk;
+
+                AudioEngine.Seek(0.5f);
+                var seeked = AudioEngine.Position;
+                var seekOk = Math.Abs(seeked - 0.5f) < 0.2f;
+                log.Add("  seek(0.5s) lands at " + seeked.ToString("F2") + "s                               " +
+                        (seekOk ? "-> OK" : "-> FAIL"));
+                ok &= seekOk;
+
+                AudioEngine.Close();
+
+                // 拿文本文件冒充 mp3：必须被判"解不了"，否则探测就是摆设
+                var fakePath = Path.Combine(audioDir, "fake.mp3");
+                File.WriteAllText(fakePath, "this is definitely not audio");
+                var fakeOk = !AudioEngine.CanDecode(fakePath);
+                log.Add("  a text file posing as .mp3 is rejected                                " +
+                        (fakeOk ? "-> OK" : "-> FAIL"));
+                ok &= fakeOk;
+            }
+
+            // ---- LRC 歌词：解析 / 一行多标签 / 二分查当前句 ----
+            {
+                var lrcOnlyAudio = Path.Combine(audioDir, "song.mp3");   // 只在找同名 .lrc 时用
+                var lrcFile = Path.Combine(audioDir, "song.lrc");
+                File.WriteAllText(lrcFile,
+                    "[ti:标题]\r\n[ar:歌手]\r\n[00:01.00]第一句\r\n[00:03.50]第二句\r\n" +
+                    "[00:06.00][00:09.00]重复句\r\n[00:12.00]最后一句\r\n",
+                    new System.Text.UTF8Encoding(false));
+
+                var parsed = Lrc.Load(lrcOnlyAudio);
+                var lineCount = parsed == null ? 0 : parsed.Lines.Count;
+                var indexAt2 = parsed == null ? -99 : parsed.IndexAt(2.0);
+                var indexAt7 = parsed == null ? -99 : parsed.IndexAt(7.0);
+                var indexAt0 = parsed == null ? -99 : parsed.IndexAt(0.5);
+
+                // 期望 5 句：1.00 / 3.50 / 6.00 / 9.00 / 12.00（[ti:]/[ar:] 不算，
+                // 一行挂两个标签的算两句）
+                var lrcOk = lineCount == 5 && indexAt2 == 0 && indexAt7 == 2 && indexAt0 == -1;
+                log.Add("  lrc: " + lineCount + " lines (meta tags skipped, [00:06][00:09] split), " +
+                        "index@0.5=" + indexAt0 + " @2.0=" + indexAt2 + " @7.0=" + indexAt7 +
+                        "   " + (lrcOk ? "-> OK" : "-> FAIL"));
+                ok &= lrcOk;
+            }
+
+            try { Directory.Delete(audioDir, true); }
+            catch { /* 临时目录留着也无所谓 */ }
+
+            // ---- 界面语言 / 素材目录树 ----
+            //
+            // 这几条不依赖窗口：语言文件是否生成、BCP 47 归一化、locales.toml 往返、
+            // 以及"树里的总数 == 扁平列表总数"这个不变式。
+            var localeOk = true;
+            foreach (var code in new[] { "zh-cn", "en-us" })
+            {
+                var localeFile = Path.Combine(Path.Combine(AppEnv.Root, "locales"), code + ".json");
+                var exists = File.Exists(localeFile);
+                localeOk &= exists;
+                if (!exists) continue;
+                var obj = MiniJson.ParseObject(File.ReadAllText(localeFile, System.Text.Encoding.UTF8));
+                localeOk &= obj != null && !string.IsNullOrEmpty(MiniJson.GetString(obj, "sidebar.map"));
+            }
+            log.Add("  locales/*.json written with keys                                  " +
+                    (localeOk ? "-> OK" : "-> FAIL"));
+            ok &= localeOk;
+
+            var bcpOk = Loc.Normalize("zh-Hans-CN") == "zh-cn" &&
+                        Loc.Normalize("zh-CN") == "zh-cn" &&
+                        Loc.Normalize("en-GB") == "en-us" &&
+                        Loc.Normalize("fr-FR") == "zh-cn";
+            log.Add("  bcp47 normalisation: zh-Hans-CN/zh-CN->zh-cn, en-GB->en-us    " +
+                    (bcpOk ? "-> OK" : "-> FAIL"));
+            ok &= bcpOk;
+
+            var folderDir = Path.Combine(Path.GetTempPath(), "trpgm-locale-selfcheck");
+            var folderOk = false;
+            try
+            {
+                Directory.CreateDirectory(folderDir);
+                var created = FolderLocale.Ensure(folderDir);
+                File.WriteAllText(Path.Combine(folderDir, FolderLocale.FileName),
+                    "[zh-cn]\r\nfoldername = \"测试文件夹\"\r\n[en-us]\r\nfoldername = \"Test folder\"\r\n",
+                    new System.Text.UTF8Encoding(false));
+
+                var previousLang = Loc.Language;
+                Loc.SetLanguage("zh-cn", false);
+                var zhName = FolderLocale.DisplayName(folderDir, "fallback");
+                Loc.SetLanguage("en-us", false);
+                var enName = FolderLocale.DisplayName(folderDir, "fallback");
+                Loc.SetLanguage(previousLang, false);
+
+                folderOk = created && zhName == "测试文件夹" && enName == "Test folder";
+            }
+            catch (Exception ex)
+            {
+                log.Add("    locales.toml: " + ex.Message);
+            }
+            finally
+            {
+                try { Directory.Delete(folderDir, true); } catch { }
+            }
+            log.Add("  folder locales.toml: [zh-cn]/[en-us] foldername honoured        " +
+                    (folderOk ? "-> OK" : "-> FAIL"));
+            ok &= folderOk;
+
+            var treeOk = true;
+            var treeCatalog = new TerrainCatalog();
+            foreach (var kind in DrawKind.All)
+            {
+                var flat = treeCatalog.Of(kind).Count;
+                var tree = treeCatalog.TreeOf(kind).TotalCount;
+                if (flat != tree) treeOk = false;
+            }
+            log.Add("  asset tree total == flat list total (" + treeCatalog.Of(DrawKind.Entity).Count +
+                    " entity item(s))   " + (treeOk ? "-> OK" : "-> FAIL"));
+            ok &= treeOk;
+
             // ---- 退出房间：令牌校验 → 名册里删掉 → 令牌作废 ----
             var settings = new ServerSettings(path);
             var game = new GameState(settings);
@@ -2349,6 +2725,37 @@ namespace TrpgMaps
             ok &= leaveOk;
 
             return ok;
+        }
+
+        /// <summary>
+        /// 写一个最小的 8kHz / 单声道 / 16 位 WAV，给音频自检当素材用。
+        /// 44 字节的头手写 —— 为了一个自检去引任何东西都不值当。
+        /// </summary>
+        private static void WriteToneWav(string path, double seconds)
+        {
+            const int rate = 8000;
+            var samples = (int)(rate * seconds);
+            var dataSize = samples * 2;
+
+            using (var stream = new FileStream(path, FileMode.Create, FileAccess.Write))
+            using (var writer = new BinaryWriter(stream))
+            {
+                writer.Write(new byte[] { (byte)'R', (byte)'I', (byte)'F', (byte)'F' });
+                writer.Write(36 + dataSize);
+                writer.Write(new byte[] { (byte)'W', (byte)'A', (byte)'V', (byte)'E' });
+                writer.Write(new byte[] { (byte)'f', (byte)'m', (byte)'t', (byte)' ' });
+                writer.Write(16);                    // fmt 块长度
+                writer.Write((short)1);              // PCM
+                writer.Write((short)1);              // 单声道
+                writer.Write(rate);
+                writer.Write(rate * 2);              // 字节率
+                writer.Write((short)2);              // 块对齐
+                writer.Write((short)16);             // 位深
+                writer.Write(new byte[] { (byte)'d', (byte)'a', (byte)'t', (byte)'a' });
+                writer.Write(dataSize);
+                for (var i = 0; i < samples; i++)
+                    writer.Write((short)(3000 * Math.Sin(i * 0.1)));
+            }
         }
 
         private static bool Expect(List<string> log, Dictionary<string, double> measured,

@@ -84,6 +84,18 @@ namespace TrpgMaps
             Width = CollapsedWidth;
         }
 
+        /// <summary>
+        /// 换一整套按钮文字（切界面语言用）。数量按调用方给的对齐，多余的保持原样。
+        /// 只重画文字，不动图标和布局。
+        /// </summary>
+        public void SetLabels(string[] labels)
+        {
+            if (labels == null) return;
+            var count = Math.Min(labels.Length, _labels.Length);
+            for (var i = 0; i < count; i++) _labels[i] = labels[i];
+            Invalidate();
+        }
+
         /// <summary>当前宽度在"收起 ↔ 展开"之间的插值系数 0-1。</summary>
         private double ExpandRatio
         {

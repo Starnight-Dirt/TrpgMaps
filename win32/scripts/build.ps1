@@ -143,6 +143,37 @@ if ($exit -ne 0) {
     exit $exit
 }
 
+# ------------------------------------------------- i18n guard
+# Source-level check (see scripts/check_i18n.py): every key the code asks for
+# exists in the word list, every entry has both languages, and no user-visible
+# string is hardcoded in Chinese again. That last one is the v1.0.3 bug - the
+# word list looked complete while half the status lines bypassed it.
+$py = Get-Command python -ErrorAction SilentlyContinue
+$pyExe = $null
+if ($py) { $pyExe = $py.Path; if (-not $pyExe) { $pyExe = $py.Source } }
+$i18nScript = Join-Path $PSScriptRoot 'check_i18n.py'
+
+if ($pyExe -and (Test-Path $i18nScript)) {
+    $i18nLog = Join-Path $logDir 'i18n-check.txt'
+    & $pyExe $i18nScript *> $i18nLog
+    $i18nCode = $LASTEXITCODE
+    if ($i18nCode -ne 0) {
+        if (Test-Path $i18nLog) { Get-Content $i18nLog -Encoding UTF8 | Write-Host }
+        Write-Host ""
+        Write-Host "BUILD FAILED (i18n guard). Log: $i18nLog"
+        exit $i18nCode
+    }
+    $i18nSummary = (Get-Content $i18nLog -Encoding UTF8 -ErrorAction SilentlyContinue |
+                    Where-Object { $_ -match 'keys defined' } | Select-Object -First 1)
+    if ($i18nSummary) {
+        Write-Host ("i18n    : OK," + $i18nSummary.Trim())
+    } else {
+        Write-Host "i18n    : OK"
+    }
+} else {
+    Write-Host "i18n    : skipped (python not found)"
+}
+
 $outDir = Join-Path $projectDir $outSub
 $exe = Join-Path $outDir 'TrpgMaps.exe'
 Write-Host ""

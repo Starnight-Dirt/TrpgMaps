@@ -108,15 +108,20 @@ Resources\appicon.ico ← 窗口图标（exe 自己的图标已内嵌；这个�
 Resources\avatar.png  ← 「关于」面板的头像（丢了只是不显示头像）
 maps\                       ← 底图（可自行增删）
 terrain\ entity\ item\      ← 地形 / 实体 / 物品素材（可自行增删）
+audio\                      ← 音乐（自己放进去；首次运行自动创建，见「音频播放器」）
+locales\                    ← 界面语言词表（zh-cn.json / en-us.json，见「界面语言」）
+locale.json                 ← 上次选的语言（自动生成，可删）
 wwwroot\                    ← 玩家端网页
+TrpgAudio.dll               ← 音乐播放器的原生层（本工程唯一的运行期 DLL，见「音频播放器」）
 放行防火墙.bat              ← 可选，手机连不上时的双击修复入口（见第 13 节）
 ```
 
-**没有任何第三方 DLL。** 体积分两部分看：
+**运行期只有一个非托管 DLL：`TrpgAudio.dll`**（音乐播放器，686 KB，源码在 `native\`，
+许可见 `native\THIRD-PARTY.txt`）—— 除此之外没有任何第三方 DLL。体积分两部分看：
 
 | | 大小 |
 |---|---|
-| **程序本体**（exe + config + wwwroot + 图标 + 头像） | **约 0.9 MB** |
+| **程序本体**（exe + config + TrpgAudio.dll + wwwroot + 图标 + 头像） | **约 1.6 MB** |
 | 自带素材数据（`maps\` ≈ 2.6 MB + `terrain\` ≈ 1.6 MB） | 约 4.2 MB |
 
 > 底图是 19 张 1672×941 的图（早期是 PNG、合计 50 MB；第十二轮换成内置解码器
@@ -719,7 +724,10 @@ WheelStep = 64;   // 一格滚轮 64px
 > 📌 这条坑对**测试脚本**同样成立：`auth_test.ps1` 里原来的临时端口 `5123` 正好落在
 > 预留段 `5041–5140` 里，于是报"新端口连不上"。写死端口的脚本请顺手确认一下。
 
-`--ui` 的模式：`base`｜`sidebar`｜`map`｜`mapcollapsed`｜`grid35`｜`closeall`｜`gridreopen`｜`net`｜`about`｜`rotate90`｜`gridcolor`｜`draw`｜`drawbrush`｜`drawcone`｜`drawbrushloose`｜`drawtangent`｜`fs`｜`toast`｜`all`。
+`--ui` 的模式：`base`｜`sidebar`｜`map`｜`mapcollapsed`｜`grid35`｜`closeall`｜`gridreopen`｜`net`｜`about`｜`rotate90`｜`gridcolor`｜`draw`｜`drawbrush`｜`drawcone`｜`drawbrushloose`｜`drawtangent`｜`audio`｜`drawentity`｜`fs`｜`toast`｜`all`。
+
+> `drawentity` 是**独立**的一次进程（不进 `all`）：它打开绘图面板、切到「实体」、把整棵素材树展开，
+> 专门用来看「文件夹 = 折叠菜单」的样子。
 - `grid35` = 把网格滑块拉到 3.5cm；`closeall` = 关闭全部面板后再截一张；
   `gridreopen` = **先设成 3.5cm、关闭面板、重新打开**，用来验证滑块复位 bug 有没有复发；
   `about` = 展开侧栏 + 打开「关于」面板（头像 / 版本 / 作者链接 / 更新状态）。
@@ -735,7 +743,7 @@ WheelStep = 64;   // 一格滚轮 64px
   两张对着看就能确认红色确实把蓝圆压到的格都算上了（13 格 → 21 格）；
   `drawtangent` = **半径定死 1.5 格（7.5 尺）+ 宽泛**：圆正好和上下左右四条格线相切，
   切线外那一圈按新规则**不算**被扫到（红 9 格，和严格一样）—— 这是"相切算不算"的判据现场；
-- `all` = 在**同一个进程里**依次截全部 15 张（`01-base` … `15-about`），
+- `all` = 在**同一个进程里**依次截全部 16 张（`01-base` … `15-about` + `16-audio`），
   这样无人值守时只需启动一次程序，尽量少触发"是否允许运行"这类系统弹窗。
   `draw` / `drawbrush` / `drawcone` / `drawbrushloose` / `drawtangent` 前面会先 `CloseAll`，
   否则上一步留下的「地图设置」面板会挡住左半边地图，选区一半在面板底下。
@@ -749,7 +757,7 @@ WheelStep = 64;   // 一格滚轮 64px
   `fs-b.png` = 紧跟着**退出全屏、再重新全屏**之后那张（**故意什么都不补**）。
   两张只差"做没做全屏往返"这一点，逐像素一比就知道**窗口变大后新露出的区域刷没刷**
   （第二十五轮那个"下边 + 右边是空的"的回归锁）。
-  > 它**不**放进 `all`：一是不想动 15 张那个约定，二是它必须独占一次进程 ——
+  > 它**不**放进 `all`：一是不想动那个张数约定，二是它必须独占一次进程 ——
   > 两张图要的"静置"不同。
 - `toast` = 顶部胶囊提示（「xxx 离开了房间」）**停住**的样子 —— 走的是真接口那条路
   （`ShowPlayerLeftToast`），框架在 1.2s 后抓图，正好落在"下滑完 → 停留 2 秒"那一段里。
@@ -837,12 +845,38 @@ WheelStep = 64;   // 一格滚轮 64px
 是 **Win10 1809** 才加进去的，Win7 完全没有。所以 `Image.FromStream` 对任何 `.webp` 一律抛异常 ——
 底图列表里看得见，画出来却是**全黑**（预览和「地图设置」里的缩略图一起黑）。
 
-能不能退一步引个库？不能：本项目最大的卖点就是「**没有任何第三方 DLL**」（见第 6 节的目录结构，
-exe + config + wwwroot 就这些）。引 `libwebp.dll` 会把这个优点直接抹掉，所以**自己实现**。
+能不能退一步引个库？不能：本项目最大的卖点就是「**运行期没有第三方 DLL**」（见第 6 节的目录结构，
+exe + config + wwwroot 就这些。v1.0.2 起唯一的例外是音乐播放器的 `TrpgAudio.dll`，
+而且它也是**自己编的**）。引 `libwebp.dll` 会把这个优点直接抹掉，所以**自己实现**。
 
 解码器严格按 **RFC 6386** 写：RIFF/WEBP 容器 → VP8 关键帧帧头 → 布尔算术解码器 →
 分段 / 环路滤波 / 量化 / 参考帧 / 熵头 → 令牌分区 → 逐行重建（含 4×4 与 16×16 预测模式、WHT、IDCT）→
 环路滤波 → YUV→BGRA。**只支持 lossy `VP8 ` 关键帧**（本项目的底图全是这种）。
+
+#### 🔴 带透明通道的 WebP **解不了** —— 请用 PNG
+
+有损 `VP8 ` 块里**没有 alpha**。带透明的 WebP 是 `VP8X + ALPH + VP8 ` 三段，
+alpha 单独存在 `ALPH` 块里、而且是**无损（VP8L）压缩**的 ——
+那需要一整套 VP8L 解码器（Huffman + LZ77 + 预测/调色板变换），本项目没有实现。
+
+所以：
+
+| 文件 | 结果 |
+|---|---|
+| 不带 alpha 的 WebP（底图、地形图） | ✅ 正常 |
+| **带 alpha 的 WebP**（角色图、抠好的贴图） | ❌ **明确报错**（`NotSupportedException`），请改存 PNG |
+
+> ⚠️ 这条**曾经是静默的**：`FindVp8Chunk` 一遇到 `VP8 ` 块就 `return`，而 `ALPH` 排在它**前面**，
+> 于是"带 alpha 就报错"那句永远走不到 —— alpha 被直接丢掉、整张图变成**不透明**。
+> 表现是：角色周围本该透明的地方变成一块底色，边缘那圈半透明亮像素变成
+> **一圈白色撕裂**（用户的原话）。第十八轮改成"扫完所有块再判断"，现在会明确报错。
+> 排错工具：`TrpgMaps.exe --dump-webp <输入> <输出.png>`，能把解码器吐出来的像素原样存下来，
+> 跟 libwebp（Pillow/cwebp）的结果逐像素对比。
+
+**要带透明又想省体积**：把 WebP 转回 PNG，用 `scripts/webp_to_png.py` ——
+它会做 **alpha 补色**（把透明区的 RGB 用最近的实心像素色填满）。
+不补色的话，缩放/贴图时插值会把"透明区残留的背景色"拉进边缘，就是那圈**白边/绿边**。
+默认缩到 512（地图一格约 95px，5 倍余量足够）；`--size 1024 --keep-size` 可改。
 
 #### 两个必须记住的坑
 
@@ -1131,6 +1165,103 @@ GDI+ 的 `AddArc` 也是"从 +x 轴出发、屏幕上顺时针为正"，可以�
 
 ---
 
+### 音频播放器（v1.0.2 加）
+
+侧栏「**音频**」（在「全屏」上面一格）打开。**音乐放进 exe 旁边的 `audio\` 目录**
+（与 `maps\`、`terrain\` 同级，首次运行自动创建），支持**一层子目录**分组 ——
+`audio\战斗\紧张.mp3` 在列表里显示成 `紧张    战斗`。
+
+| 能干什么 | 说明 |
+|---|---|
+| 播放 / 暂停 / 上一曲 / 下一曲 | 曲目列表**双击**播放；面板关掉音乐照常放 |
+| 拖进度条 | 拖动时只记位置，**松手后那一拍才真跳** —— 流式解码器经不起来回打断 |
+| 音量 | 0–100，跨曲目保留 |
+| 播放模式 | **单曲循环**（默认，每次启动都是它）/ 顺序播放 / 随机播放，点一下换一个 |
+| 歌词 | 同名 `.lrc` 自动当歌词。**三行式**：上一句 / **当前句（高亮）** / 下一句 |
+
+**格式支持**（32 位真机实测，不是查文档抄的）：
+
+| 格式 | 结果 |
+|---|---|
+| MP3 / WAV | ✅ 时长、拖动、暂停都准 |
+| FLAC / OGG | ✅ 同上（OGG 的时长要单独量一次，见下） |
+| **M4A / AAC / WMA** | ✅ 交给 **Windows 自带的解码器**（Media Foundation），整首解到内存再放（约 10 MB/分钟） |
+
+#### 为什么带了个 DLL（本工程唯一一个运行期非托管 DLL）
+
+系统自带的 MCI 只能放 MP3 / WAV：实测 **OGG 直接打不开、M4A 也不认**。而市面上现成的
+音频库（BASS、FMOD）都是"**非商业免费**"，跟着一个可能做成 MIT 的项目分发会有授权冲突。
+所以自带一个 **686 KB 的自研 DLL**：
+
+| 组件 | 许可 | 干什么 |
+|---|---|---|
+| **miniaudio** v0.11.25 | 公共领域 / MIT-0 | 出声 + WAV / MP3 / FLAC 解码 |
+| **stb_vorbis** v1.22 | 公共领域 / MIT | OGG Vorbis 解码 |
+| `native\audio_bridge.c` | 本项目 | 那层薄薄的 C 接口（C# 直接 P/Invoke，无包装程序集） |
+| `native\mf_aac.cpp` | 本项目 | 用 **Windows Media Foundation**（系统自带 AAC 解码器，Win7 起就有）补上 m4a / aac / wma |
+
+两个库都能跟着 MIT 项目自由分发（全文见 `native\THIRD-PARTY.txt`）。
+DLL 的**源码也在包里**（`native\miniaudio.h` + `stb_vorbis.c` + `audio_bridge.c`），
+`scripts\build_audio_dll.ps1 -Rebuild` 一条命令重建。
+**`TrpgAudio.dll` 不在**时程序照常跑，只是音频面板显示"功能不可用"。
+
+> ⚠️ 三个只有真踩过才知道的坑：
+> ① **miniaudio 不内嵌 OGG 解码器** —— 要自己把 `stb_vorbis.c` 编进去，而且**顺序有讲究**
+> （头在前、实现放在 miniaudio 之后，否则它的宏会漏进 `windows.h`，报一堆
+> `winnt.h: error C2059`）；
+> ② **OGG 的时长在推流模式下取不到**（`ma_sound_get_length_in_seconds` 回 0），
+> 得另外用 stb_vorbis 单开一次文件量（`audio_bridge.c` 的 `vorbis_length_seconds`）。
+> 少了这一步，进度条就会永远是 0；
+> ③ **`ma_audio_buffer` 的采样率要自己填** —— v0.11 的 `ma_audio_buffer_config_init()` 把
+> `sampleRate` 留在 0（头文件里就写着「v0.12 才会自动设」），忘了填 m4a 就会用**声卡的**
+> 采样率去播 —— 听上去**音调是错的**。
+
+### 实体 / 物品：子文件夹与 locales.toml（v1.0.3 加）
+
+`entity\` 与 `item\` 下面可以随意建子文件夹（**支持多层嵌套**）——角色图按职业分、
+物品按类型分，比全堆在一个目录里清楚得多。列表里：
+
+| 行 | 样子 | 点击 |
+|---|---|---|
+| 文件夹 | **三角号**（▶ 折叠 / ▼ 展开）+ 显示名 + 图片总数 | 展开 / 折叠 |
+| 图片 | 缩进 + 缩略图 + 名称 + 属性 | 选中（画到地图上） |
+
+- 子目录里的图片**和根目录的一样能用**：缩略图、贴图、手机端的瓦片接口都走同一条
+  「分类/相对路径」（例如 `entity/character/战士.png`），绘图数据里记的也是这个相对路径。
+- 名字太长、或者嵌套太深被横向裁掉时，列表**底部会出现横向滚动条** ——
+  和竖向那条一样是 4px 细线，`Shift + 滚轮` 也能横向滚。
+- **每个文件夹首次被扫描时会自动生成 `locales.toml`**：
+
+```toml
+[zh-cn]
+foldername = ""
+[en-us]
+foldername = ""
+```
+
+  填上 `foldername` 后，列表里就用它代替文件夹本名；**留空 = 用文件夹本名**。
+  段名是 BCP 47 语言标签（`zh-CN`、`zh` 也认，统一按小写处理），
+  当前界面语言没有对应值就回退到文件夹本名。**素材的显示语言跟随程序语言**，
+  不单独去读系统语言。
+
+> 目录扫描上限 8 层（防止有人把整个盘符软链进来）；隐藏目录（`.` 开头）会被忽略。
+> 地形（`terrain\`）仍然是扁平的 —— 它的 `terrain_properties.json` 一直按扁平写的。
+
+### 界面语言（v1.0.3 加）
+
+- 词表在 `locales\`：`zh-cn.json`、`en-us.json`，就是普通的「键 → 文字」对象，
+  **可以直接改**（改完重启生效）。程序启动时只会**补缺失的键**，不会覆盖你改过的值。
+- 首次启动按**系统语言**自动选（zh-* → 简体中文，en-* → English，其它 → 简体中文）；
+  选过之后记在 `locale.json` 里，下次沿用。
+- 在「关于」面板的「界面语言」里切换：下拉第一项是**系统语言 +（推荐）**
+  （用该语言自己的写法），其余按英文名首字母排序。
+- 点「应用」会**立刻切换**并弹确认框：点「保留」写入设置；
+  **点「取消」或等 15 秒**自动回退到原来的语言。先切再问是刻意的 ——
+  你能当场看到切换后的样子，而不是对着一串语言名猜。
+- 关闭程序也会弹一个同款确认框（蓝底白字「确认」/ 灰底白字「取消」），
+  防止误点右上角的 ×。
+- 目前覆盖：侧栏、绘图面板、地图 / 网络 / 音频面板的标题与主要按钮、关于面板、弹窗。
+
 ## 4. 玩家名 / 令牌 / 房间号
 
 （玩家名与令牌的规则与 MAUI 版 / 原 Python 版完全一致；**房间号与退出机制是 v1.0.2 新增的**）
@@ -1296,6 +1427,11 @@ win7版本/
 │  ├─ GridAnchor.cs           **坐标契约**：底图占几格 + 画布半宽半高几格（见第 3.2 节）
 │  ├─ Room.cs                 房间号（8 位随机、避重）+ 可选密码 + 玩家地址拼装（见第 4 节）
 │  ├─ PortPicker.cs           默认端口绑不上时按"顺延 → 随机"挑一个真正能用的（见「关于端口」）
+│  ├─ AudioEngine.cs          P/Invoke 封装的音乐播放器原生层（TrpgAudio.dll）
+│  ├─ AudioLibrary.cs         audio\ 目录扫描 + 同名 .lrc 查找
+│  ├─ Lrc.cs                  .lrc 解析（一行多标签 / UTF-8 与 GBK 自动识别）
+│  ├─ I18n.cs                 界面语言：BCP 47 归一化 + locales\*.json 读写 + 取词
+│  ├─ FolderLocale.cs         素材文件夹的 locales.toml（foldername）读写与自动生成
 │  ├─ GameState.cs            名册、令牌、房间锁、在线状态、退出房间
 │  ├─ RealtimeHub.cs          SSE 订阅与广播
 │  ├─ MiniJson.cs             手写 JSON 读写（不引第三方库）
@@ -1311,7 +1447,8 @@ win7版本/
 │  ├─ _msbuild.ps1            共用的小工具：定位 MSBuild（被三个构建脚本点源）
 │  ├─ smoke_test.ps1          端到端冒烟测试（JSON 请求体一律走 Post-Json 发 UTF-8 字节）
 │  ├─ auth_test.ps1           令牌 / 房间锁 / 改端口测试
-│  ├─ ui_shot.ps1             无人值守界面截图（-Mode all 一个进程截 15 张，-Height 可压窗口高度）
+│  ├─ ui_shot.ps1             无人值守界面截图（-Mode all 一个进程截 16 张，-Height 可压窗口高度）
+│  ├─ build_audio_dll.ps1     重编 TrpgAudio.dll（MSVC，自己配 INCLUDE/LIB，不调 vcvars）
 │  ├─ crop_zoom.ps1           从 PNG 裁一块并放大，专门用来盯 4px 滑块 / 1px 描边
 │  ├─ inspect_shot.py         截图逐像素分析（找边界、量缝隙，需要 Pillow）
 │  ├─ measure_grid.py         从 PNG 量网格线间距、与标称值比对（纯标准库，无需 Pillow）
@@ -1339,6 +1476,13 @@ win7版本/
 ├─ updater/                   升级器（独立工程，见第 14 节）
 │  ├─ TrpgMapsUpdater.csproj  只链四个 Core 文件，编出来几十 KB
 │  └─ Program.cs              --apply / --delete-only / --register-only / --test-zip
+├─ native/                    音乐播放器的原生层（C，见「音频播放器」一节）
+│  ├─ audio_bridge.c          自研桥接层：导出十几个 trpg_audio_* 函数给 C# 调
+│  ├─ miniaudio.h             miniaudio v0.11.25（公共领域 / MIT-0，4.1 MB 单头文件）
+│  ├─ stb_vorbis.c            stb_vorbis v1.22（公共领域，OGG 解码）
+│  ├─ mf_aac.cpp / mf_aac.h   Media Foundation 解码层（m4a / aac / wma，用系统解码器）
+│  ├─ THIRD-PARTY.txt         上面两个库的许可与出处（**MIT 项目必须留着**）
+│  └─ bin/x86/TrpgAudio.dll   编出来的产物（1.6 MB 的 .obj 之类不进源码包）
 ├─ version.json               发布清单（程序靠它判断有没有新版本；**要提交**）
 ├─ wwwroot/                   玩家端页面（player.html / js / css / images）
 │  ├─ images/draw.png         绘图面板的侧栏图标（纯标准库脚本生成，无外部依赖）
@@ -1365,7 +1509,7 @@ win7版本/
 > ⚠️ **v1.0.2 这一版暂时是"win7 领先"的**：房间号 / 房间密码 / 退出房间 / `/join` 页
 > 只做在本版，MAUI 版还没跟上（用户明确说过"MAUI 以后跟进"）。所以那一版现在：
 > 地址仍然是 `ip:port/player`、**默认端口仍是 5000**、`/api/login` 不认 `room`/`passwd` 字段、
-> 没有 `/api/leave`、`/api/room` 与 `/join`。
+> 没有 `/api/leave`、`/api/room` 与 `/join`，**也没有音频播放器**（那 686 KB 的原生 DLL 是 win7 版自己的）。
 > 两边各自都是自洽的（各自发自己的页面、自己的接口），玩家端不会串；
 > 但**迁移到 MAUI 时要照第 4 节与第 7 节的接口表补一遍**，
 > 否则玩家在新旧两版之间切换会看到"房间号对不上"。
@@ -1539,6 +1683,18 @@ python scripts\check_player_room.py
 | 退出：房间号不对 → `ROOM_GONE`、令牌不对 → `TOKEN_MISMATCH`（两人都还在名册里） | 失败的退出**不能**误删别人 |
 | 退出成功后名册里没有他了、**旧令牌也不再生效** | "清除这个房间对该玩家的记忆" |
 | 清掉密码后陌生人又能直接进 | 取消密码这条路是通的 |
+
+`--selfcheck` 里音频那几条（**不要求用户先放音乐** —— 自己现场生成一个 8kHz 的 WAV 来测）：
+
+| 断言 | 在钉什么 |
+|---|---|
+| `TrpgAudio.dll` 能加载，能报出版本串 | DLL 在、音频设备开得起来（不在时打 `SKIP` 而不是 FAIL） |
+| 生成的 WAV → `probe` 判"能解码" | 原生层真的读得懂格式 |
+| 打开后 `length ≈ 1.00s` | 时长正确（进度条的分母） |
+| 播放 300ms 后 `position > 0` | 真的在走 |
+| `seek(0.5)` 落在 `0.5s` | 拖进度条有用 |
+| 文本文件冒充 `.mp3` → 判"不能解码" | 探测不是摆设（m4a 就是靠它标"不支持此格式"的） |
+| LRC：5 句、`[ti:]/[ar:]` 不算、`[00:06][00:09]` 拆成两句、`index@0.5=-1 @2.0=0 @7.0=2` | 歌词时间轴与二分查找 |
 | `/join` 发页面、且页面里有 `room-number-input` | 手填房间号那条路真的存在 |
 | `/api/room?room=` 的三态：号不对 → `exists=false`；号对密码不对 → `passwordOk=false`；都对 | "**房间不存在**"与"**房间密码错误**"必须分得开（`/join` 页就靠这个提示） |
 | 校验响应里**没有密码本身** | 别把房间敞开给任何人 |
@@ -2208,7 +2364,8 @@ powershell -ExecutionPolicy Bypass -File scripts\make_release.ps1
 
 ### 14.2 为什么安装包和升级器都是自己写的 C#
 
-本工程是"零第三方运行期 DLL + 单 exe 绿色部署"路线（见第 2 节），
+本工程是"**运行期零第三方 DLL** + 单 exe 绿色部署"路线（见第 2 节；唯一的例外是自己编的
+`TrpgAudio.dll`，那是音乐播放器，见「音频播放器」一节），
 引入 Inno Setup / NSIS 就等于给发布流程加一个外部工具依赖，而且它们生成的卸载器
 是另一个 exe，风格、编码、报错方式全都不一样。自己写两个小工程反而更省事：
 

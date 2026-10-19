@@ -31,7 +31,7 @@
      * 一眼就能确认"平板跑的到底是哪一版"。浏览器缓存 + 旧 exe 里的旧 wwwroot
      * 已经骗过我们好几次了（改了 js、平板上看着却纹丝不动）。
      */
-    const PLAYER_JS_REV = 'r27-2026-10-14-join页与默认端口';
+    const PLAYER_JS_REV = 'r28-2026-10-19-设置菜单与语言';
     // 顺手挂到 window 上：目视夹具（scripts\player_orientation_fixture.html）会读它，
     // 用来确认"页面上跑的到底是哪一版"。不参与任何逻辑。
     window.__playerJsRev = PLAYER_JS_REV;
@@ -59,6 +59,12 @@
     const toastEl = document.getElementById('player-toast');
     const roomNumInput = document.getElementById('room-number-input');
 
+    // 悬浮菜单：分页（根 / 设置 / 语言）与语言列表
+    const settingsBtn = document.getElementById('settings-btn');
+    const languageBtn = document.getElementById('language-btn');
+    const languageValue = document.getElementById('language-value');
+    const languageList = document.getElementById('language-list');
+
     /**
      * 这一页是不是 `/join`（手填房间号的那种）。
      *
@@ -82,6 +88,343 @@
     // 以前那种柔和的 #6a6 在一眼扫过去时和灰色没差多少。
     const ONLINE_COLOR = '#00e676';
     const OFFLINE_COLOR = '#ff6666';
+
+
+    // ============================================================
+    //  界面语言（网页端自己的，和 DM 电脑上的程序语言互不影响）
+    //
+    //  入口：悬浮按钮 → 设置 → 语言。
+    //  顺序规则和电脑版一致：**系统语言置顶并标「推荐」**，其余按英文名首字母排序。
+    //  和电脑版只有一点不同：这里选了就立刻生效、直接记住，
+    //  没有「保留 / 取消 + 15 秒回退」的确认框 —— 网页上再弹一层太啰嗦。
+    // ============================================================
+
+    const LANG_KEY = 'dnd_player_lang';
+
+    // 新增语言只要往这里加一行、再补一份 STRINGS。
+    const LANGS = [
+        { code: 'zh-cn', native: '简体中文', english: 'Chinese (Simplified)' },
+        { code: 'en-us', native: 'English', english: 'English (United States)' },
+    ];
+
+    // 「推荐」用每门语言自己的写法（和电脑版的 Loc.TextIn 一致）
+    const LANG_RECOMMENDED = { 'zh-cn': '（推荐）', 'en-us': ' (Recommended)' };
+
+    const STRINGS = {
+        'zh-cn': {
+            'app.title': 'TrpgMaps 玩家视图',
+            'login.title': '🎲 加入游戏',
+            'login.locked': '🔒 房间已锁定',
+            'login.room.placeholder': '房间号（8 位数字）',
+            'login.name.placeholder': '输入你的玩家名称',
+            'login.pass.placeholder': '房间密码',
+            'login.enter': '进入',
+            'map.alt': '地图',
+            'common.unknown': '未知',
+            'status.online': '● 在线',
+            'status.offline': '● 离线',
+            'fab.menu': '菜单',
+            'fab.settings': '设置',
+            'fab.exit': '退出房间',
+            'fab.language': '语言',
+            'fab.back': '← 返回',
+
+            'login.fill': '请填写房间号{0}，以及你的玩家名称',
+            'login.fill.passpart': '与房间密码',
+            'login.room.invalid': '房间号是 8 位数字',
+            'login.room.notfound': '房间不存在',
+            'login.room.check': '请核对 DM 屏幕上显示的 8 位房间号',
+            'login.room.gone': '房间已不在（房间号已更换）',
+            'login.pass.wrong': '房间密码错误',
+            'login.room.needpass': '房间 {0} 需要正确的密码',
+            'login.room.needpass2': '房间号 {0} 需要密码',
+            'login.netfail': '连不上服务器，请检查网络',
+            'login.needname': '请输入名称',
+            'login.needpass': '请输入房间密码',
+            'login.failed': '登录失败',
+            'login.nametaken': '该名称已被占用；如果这是你本人，请用同一浏览器重新进入',
+            'login.tokenmismatch': '身份校验失败（令牌不匹配），该名称已被占用',
+            'login.roomlocked': '房间已锁定，暂不接受新玩家加入',
+            'login.locked.info': '房间已锁定，只有原有玩家可以用原名称重连',
+            'login.busy.room': '正在查找房间...',
+            'login.busy.enter': '正在进入...',
+            'login.busy.connect': '正在连接...',
+            'login.busy.auto': '正在自动登录...',
+            'login.hint': '请输入你的名称',
+            'login.hint.saved': '请输入名称后进入',
+            'login.rejoin': '{0}　点「进入」重新加入。',
+
+            'room.updated': '房间已更新（{0} → {1}）',
+            'room.number': '房间号 {0}',
+            'room.switching': '房间已更换，正在退出旧房间…',
+            'room.left.old': '已退出旧房间 {0}，正在加入房间 {1}',
+
+            'exit.doing': '正在退出…',
+            'exit.done': '已退出房间',
+            'exit.gone': '房间已不在，已在本地退出',
+            'exit.offline': '房间已离线，已在本地退出',
+
+            'toast.left': '{0} 离开了房间',
+            'toast.anon': '有玩家',
+            'kick.alert': '你已被 DM 踢出游戏',
+            'kick.info': '可用原名称重新进入',
+            'kick.error': '你已被DM踢出游戏',
+            'server.moved': '服务器地址已更新，正在重新连接...',
+        },
+
+        'en-us': {
+            'app.title': 'TrpgMaps Player View',
+            'login.title': '🎲 Join the game',
+            'login.locked': '🔒 Room locked',
+            'login.room.placeholder': 'Room number (8 digits)',
+            'login.name.placeholder': 'Your player name',
+            'login.pass.placeholder': 'Room password',
+            'login.enter': 'Enter',
+            'map.alt': 'Map',
+            'common.unknown': 'Unknown',
+            'status.online': '● Online',
+            'status.offline': '● Offline',
+            'fab.menu': 'Menu',
+            'fab.settings': 'Settings',
+            'fab.exit': 'Leave room',
+            'fab.language': 'Language',
+            'fab.back': '← Back',
+
+            'login.fill': 'Enter the room number{0} and your player name',
+            'login.fill.passpart': ' and password',
+            'login.room.invalid': 'The room number has 8 digits',
+            'login.room.notfound': 'Room not found',
+            'login.room.check': 'Check the 8-digit room number shown on the DM screen',
+            'login.room.gone': 'The room is gone (its number changed)',
+            'login.pass.wrong': 'Wrong room password',
+            'login.room.needpass': 'Room {0} needs the correct password',
+            'login.room.needpass2': 'Room {0} requires a password',
+            'login.netfail': "Can't reach the server — check your network",
+            'login.needname': 'Enter a name',
+            'login.needpass': 'Enter the room password',
+            'login.failed': 'Sign-in failed',
+            'login.nametaken': "That name is taken. If it's you, re-join from the same browser",
+            'login.tokenmismatch': 'Identity check failed (token mismatch); that name is already taken',
+            'login.roomlocked': "The room is locked and isn't accepting new players",
+            'login.locked.info': 'Room is locked; only existing players can re-join with the same name',
+            'login.busy.room': 'Looking up the room...',
+            'login.busy.enter': 'Joining...',
+            'login.busy.connect': 'Connecting...',
+            'login.busy.auto': 'Signing in automatically...',
+            'login.hint': 'Enter your name',
+            'login.hint.saved': 'Enter your name to continue',
+            'login.rejoin': '{0} — choose Enter to join again.',
+
+            'room.updated': 'Room updated ({0} → {1})',
+            'room.number': 'Room {0}',
+            'room.switching': 'The room changed — leaving the old one…',
+            'room.left.old': 'Left room {0}; joining room {1}',
+
+            'exit.doing': 'Leaving…',
+            'exit.done': 'Left the room',
+            'exit.gone': 'The room is gone; left locally',
+            'exit.offline': 'The room is offline; left locally',
+
+            'toast.left': '{0} left the room',
+            'toast.anon': 'A player',
+            'kick.alert': 'The DM removed you from the game',
+            'kick.info': 'You can re-join with the same name',
+            'kick.error': 'You were removed by the DM',
+            'server.moved': 'Server address changed — reconnecting...',
+        },
+    };
+
+    /** zh-* → zh-cn、en-* → en-us，其余按中文。 */
+    function normalizeLang(code) {
+        const v = String(code || '').toLowerCase().replace('_', '-');
+        if (v.indexOf('zh') === 0) return 'zh-cn';
+        if (v.indexOf('en') === 0) return 'en-us';
+        return 'zh-cn';
+    }
+
+    /** 这台设备/浏览器的系统语言（下拉框里标「推荐」的那一项）。 */
+    function systemLang() {
+        return normalizeLang(navigator.language || navigator.userLanguage || 'zh-cn');
+    }
+
+    /** 语言列表：系统语言置顶，其余按英文名首字母排序（与电脑版同一套规则）。 */
+    function langOrder() {
+        const recommended = systemLang();
+        const first = [];
+        const rest = [];
+        LANGS.forEach(function (lang) {
+            if (lang.code === recommended) first.push(lang);
+            else rest.push(lang);
+        });
+        rest.sort(function (a, b) {
+            return a.english < b.english ? -1 : (a.english > b.english ? 1 : 0);
+        });
+        return first.concat(rest);
+    }
+
+    function nativeName(code) {
+        for (let i = 0; i < LANGS.length; i++) {
+            if (LANGS[i].code === normalizeLang(code)) return LANGS[i].native;
+        }
+        return code;
+    }
+
+    // 用函数做替换，避免把玩家名里的 $& / $1 当成替换模式
+    function fill(text, a, b) {
+        return String(text)
+            .replace(/\{0\}/g, function () { return a === undefined || a === null ? '' : String(a); })
+            .replace(/\{1\}/g, function () { return b === undefined || b === null ? '' : String(b); });
+    }
+
+    function T(key, a, b) {
+        const table = STRINGS[uiLang] || STRINGS['zh-cn'];
+        let text = table[key];
+        if (text === undefined) text = STRINGS['zh-cn'][key];
+        if (text === undefined) text = key;
+        return fill(text, a, b);
+    }
+
+    /**
+     * `?lang=en-us` / `?lang=zh-CN`：只是**首次默认值**。
+     * 本机已经在菜单里选过就以那次为准（否则设了英文、刷新一下又被地址改回去）。
+     * 用途：给英语玩家发一条现成的链接；自动化检查也靠它切语言。
+     */
+    function readLangFromQuery() {
+        const m = /[?&]lang=([^&]*)/.exec(location.search || '');
+        if (!m) return '';
+        try { return decodeURIComponent(m[1]); } catch (e) { return m[1]; }
+    }
+
+    let uiLang = normalizeLang(readLangFromQuery() || systemLang());
+    try {
+        const savedLang = localStorage.getItem(LANG_KEY);
+        if (savedLang) uiLang = normalizeLang(savedLang);
+    } catch (e) { /* 隐私模式下 localStorage 会抛 */ }
+
+    // 动态提示的"最后状态"：记的是**键**而不是已经翻译好的文字，
+    // 这样切语言时能整段重放一遍，不会中英混着。
+    let infoState = null;
+    let errorState = null;
+    let roomState = null;
+
+    function setInfo(key, a, b) {
+        if (!key) { infoState = null; loginInfo.textContent = ''; return; }
+        infoState = { key: key, a: a, b: b };
+        loginInfo.textContent = T(key, a, b);
+    }
+
+    function setError(key, a, b) {
+        if (!key) { errorState = null; loginError.textContent = ''; return; }
+        errorState = { key: key, a: a, b: b };
+        loginError.textContent = T(key, a, b);
+    }
+
+    /** 服务器原话（已经是中文/后端决定），没法跟着切语言。 */
+    function setErrorRaw(text) {
+        if (!text) { errorState = null; loginError.textContent = ''; return; }
+        errorState = { raw: text };
+        loginError.textContent = text;
+    }
+
+    function renderInfo() {
+        if (!infoState) { loginInfo.textContent = ''; return; }
+        if (infoState.raw) { loginInfo.textContent = infoState.raw; return; }
+        if (infoState.exitKey) {
+            loginInfo.textContent = T('login.rejoin', T(infoState.exitKey, infoState.a, infoState.b));
+            return;
+        }
+        loginInfo.textContent = T(infoState.key, infoState.a, infoState.b);
+    }
+
+    function renderError() {
+        if (!errorState) { loginError.textContent = ''; return; }
+        if (errorState.raw) { loginError.textContent = errorState.raw; return; }
+        loginError.textContent = T(errorState.key, errorState.a, errorState.b);
+    }
+
+    /** 登录失败的 code → 本地文案（服务器那句 msg 是中文，不能直接拿来用）。 */
+    function loginFailureText(code, serverMsg) {
+        switch (code) {
+            case 'NAME_TAKEN': return T('login.nametaken');
+            case 'TOKEN_MISMATCH': return T('login.tokenmismatch');
+            case 'EMPTY_NAME': return T('login.needname');
+            case 'ROOM_LOCKED': return T('login.roomlocked');
+            case 'ROOM_GONE': return T('login.room.gone');
+            case 'BAD_PASSWORD': return T('login.pass.wrong');
+            default: return serverMsg || T('login.failed');
+        }
+    }
+
+    function refreshConnectionStatus() {
+        if (!statusEl) return;
+        statusEl.textContent = socket.connected ? T('status.online') : T('status.offline');
+        statusEl.style.color = socket.connected ? ONLINE_COLOR : OFFLINE_COLOR;
+    }
+
+    /** 把当前页面上所有静态文字刷成 uiLang。 */
+    function applyI18n() {
+        document.title = T('app.title');
+        document.documentElement.lang = uiLang === 'zh-cn' ? 'zh-CN' : 'en-US';
+
+        // 用 Array.prototype.forEach.call：老 iPad Safari 上 NodeList 还没有 forEach
+        Array.prototype.forEach.call(document.querySelectorAll('[data-i18n]'), function (el) {
+            el.textContent = T(el.getAttribute('data-i18n'));
+        });
+        Array.prototype.forEach.call(document.querySelectorAll('[data-i18n-placeholder]'), function (el) {
+            el.setAttribute('placeholder', T(el.getAttribute('data-i18n-placeholder')));
+        });
+        Array.prototype.forEach.call(document.querySelectorAll('[data-i18n-alt]'), function (el) {
+            el.setAttribute('alt', T(el.getAttribute('data-i18n-alt')));
+        });
+
+        if (fab) fab.setAttribute('aria-label', T('fab.menu'));
+        if (languageValue) languageValue.textContent = nativeName(uiLang);
+        if (displayName) displayName.textContent = playerName || T('common.unknown');
+        if (exitBtn && !exitBtn.disabled) exitBtn.textContent = T('fab.exit');
+
+        renderInfo();
+        renderError();
+        if (roomState && roomInfo) roomInfo.textContent = T(roomState.key, roomState.a, roomState.b);
+
+        refreshConnectionStatus();
+        renderLangList();
+    }
+
+    /** 选一门语言：立刻生效 + 记住；没有确认框，也没有回退。 */
+    function setLanguage(code) {
+        uiLang = normalizeLang(code);
+        try { localStorage.setItem(LANG_KEY, uiLang); } catch (e) { /* 隐私模式 */ }
+        applyI18n();
+        showMenuPage('language');     // 留在语言页，能立刻看到勾选挪到哪一行
+    }
+
+    function renderLangList() {
+        if (!languageList) return;
+        languageList.innerHTML = '';
+        langOrder().forEach(function (lang, index) {
+            const btn = document.createElement('button');
+            btn.className = 'fab-item lang-item' + (lang.code === uiLang ? ' active' : '');
+            btn.setAttribute('data-lang', lang.code);
+
+            const label = document.createElement('span');
+            label.textContent = lang.native;
+            if (index === 0) {
+                const rec = document.createElement('span');
+                rec.className = 'lang-recommended';
+                rec.textContent = LANG_RECOMMENDED[lang.code] || '';
+                label.appendChild(rec);
+            }
+
+            const check = document.createElement('span');
+            check.className = 'lang-check';
+            check.textContent = '✓';
+
+            btn.appendChild(label);
+            btn.appendChild(check);
+            btn.addEventListener('click', function () { setLanguage(lang.code); });
+            languageList.appendChild(btn);
+        });
+    }
 
     let playerName = '';
     let loggedIn = false;
@@ -241,10 +584,19 @@
         passInput.style.display = show ? 'block' : 'none';
     }
 
-    function showRoomInfo(text, warn) {
+    /** 房间信息那一行（键 + 参数，切语言时能重放）。 */
+    function showRoomInfo(key, warn, a, b) {
         if (!roomInfo) return;
-        roomInfo.textContent = text || '';
-        roomInfo.style.display = text ? 'block' : 'none';
+        if (!key) {
+            roomState = null;
+            roomInfo.textContent = '';
+            roomInfo.style.display = 'none';
+            roomInfo.className = '';
+            return;
+        }
+        roomState = { key: key, a: a, b: b };
+        roomInfo.textContent = T(key, a, b);
+        roomInfo.style.display = 'block';
         roomInfo.className = warn ? 'warn' : '';
     }
 
@@ -271,8 +623,7 @@
                 // 告辞推迟到 submitJoin 真正要加入新房间的那一刻。
                 if (JOIN_MODE) {
                     if (loginInfo && !loginInfo.textContent) {
-                        loginInfo.textContent = '请填写房间号' +
-                            (needPassword ? '与房间密码' : '') + '，以及你的玩家名称';
+                        setInfo('login.fill', needPassword ? T('login.fill.passpart') : '');
                     }
                     return null;
                 }
@@ -280,7 +631,7 @@
                 const cookieRoom = getCookie(COOKIE_ROOM) || '';
 
                 if (serverRoom && roomInUrl && roomInUrl !== serverRoom) {
-                    showRoomInfo('房间已更新（' + roomInUrl + ' → ' + serverRoom + '）', true);
+                    showRoomInfo('room.updated', true, roomInUrl, serverRoom);
                     roomInUrl = serverRoom;
                     try {
                         history.replaceState(null, '',
@@ -292,7 +643,7 @@
                     return leaveOldRoom(cookieRoom, serverRoom);
                 }
                 if (serverRoom && !needPassword) {
-                    showRoomInfo('房间号 ' + serverRoom, false);
+                    showRoomInfo('room.number', false, serverRoom);
                 }
                 return null;
             })
@@ -319,12 +670,12 @@
             return null;
         }
 
-        showRoomInfo('房间已更换，正在退出旧房间…', true);
+        showRoomInfo('room.switching', true);
         return postWithTimeout('/api/leave', { room: oldRoom, name: name, token: token }, 4000)
             .catch(() => null)
             .then(() => {
                 clearRoomIdentity();
-                showRoomInfo('已退出旧房间 ' + oldRoom + '，正在加入房间 ' + newRoom, false);
+                showRoomInfo('room.left.old', false, oldRoom, newRoom);
             });
     }
 
@@ -344,9 +695,10 @@
         });
     }
 
-    function setBusy(busy, text) {
+    function setBusy(busy, key, a) {
         loginBtn.disabled = busy;
-        loginInfo.textContent = text || '';
+        if (key) setInfo(key, a);
+        else { infoState = null; loginInfo.textContent = ''; }
     }
 
     /**
@@ -358,7 +710,7 @@
     function submitJoin(name) {
         const room = (roomNumInput ? roomNumInput.value : '').trim();
         if (!/^\d{6,12}$/.test(room)) {
-            loginError.textContent = '房间号是 8 位数字';
+            setError('login.room.invalid');
             try { roomNumInput.focus(); } catch (e) { /* 忽略 */ }
             return;
         }
@@ -367,8 +719,8 @@
         const passwd = typedPasswd || roomPassword || '';
         let accepted = false;
 
-        loginError.textContent = '';
-        setBusy(true, '正在查找房间...');
+        setError('');
+        setBusy(true, 'login.busy.room');
 
         fetch('/api/room?room=' + encodeURIComponent(room) + '&passwd=' + encodeURIComponent(passwd),
               { cache: 'no-store' })
@@ -376,14 +728,14 @@
             .then((data) => {
                 if (!data || data.exists !== true) {
                     setBusy(false, '');
-                    loginError.textContent = '房间不存在';
-                    showRoomInfo('请核对 DM 屏幕上显示的 8 位房间号', true);
+                    setError('login.room.notfound');
+                    showRoomInfo('login.room.check', true);
                     return null;
                 }
                 if (data.passwordOk !== true) {
                     setBusy(false, '');
-                    loginError.textContent = '房间密码错误';
-                    showRoomInfo('房间 ' + room + ' 需要正确的密码', true);
+                    setError('login.pass.wrong');
+                    showRoomInfo('login.room.needpass', true, room);
                     try { passInput.focus(); } catch (e) { /* 忽略 */ }
                     return null;
                 }
@@ -399,7 +751,7 @@
                     try { sessionStorage.setItem(PASSWD_KEY, passwd); } catch (e) { /* 忽略 */ }
                 }
                 updatePasswordField();
-                showRoomInfo('房间号 ' + serverRoom, false);
+                showRoomInfo('room.number', false, serverRoom);
                 roomReady = true;
 
                 // 身上那份身份属于别的房间 → 先向旧房间告辞（与玩家页同一套规矩）。
@@ -411,12 +763,12 @@
             })
             .then(() => {
                 if (!accepted || exited) return;
-                setBusy(true, '正在进入...');
+                setBusy(true, 'login.busy.enter');
                 attemptLogin(name);
             })
             .catch(() => {
                 setBusy(false, '');
-                loginError.textContent = '连不上服务器，请检查网络';
+                setError('login.netfail');
             });
     }
 
@@ -429,7 +781,7 @@
 
         const name = nameInput.value.trim();
         if (!name) {
-            loginError.textContent = '请输入名称';
+            setError('login.needname');
             return;
         }
 
@@ -440,7 +792,7 @@
         }
 
         if (needPassword && passInput.style.display !== 'none' && !passInput.value.trim()) {
-            loginError.textContent = '请输入房间密码';
+            setError('login.needpass');
             try { passInput.focus(); } catch (e) { /* 忽略 */ }
             return;
         }
@@ -450,8 +802,8 @@
             try { sessionStorage.setItem(PASSWD_KEY, roomPassword); } catch (e) { /* 忽略 */ }
         }
 
-        loginError.textContent = '';
-        setBusy(true, '正在连接...');
+        setError('');
+        setBusy(true, 'login.busy.connect');
         attemptLogin(name);
     });
 
@@ -496,11 +848,12 @@
         loginOverlay.style.display = 'none';
         toolbar.style.display = 'flex';
         setFabVisible(true);
-        loginError.textContent = '';
+        setError('');
         setBusy(false, '');
         loggedIn = true;
         loginBusy = false;
         passwordRejected = false;
+        updateFabForLogin();
         applyRoomLock(data ? data.roomLocked : false);
         socket.emit('request_map');
     });
@@ -514,13 +867,14 @@
             passwordRejected = true;
             updatePasswordField();
             setBusy(false, '');
-            loginError.textContent = (data && data.msg) || '房间密码不正确';
-            showRoomInfo('房间号 ' + (serverRoom || roomInUrl) + ' 需要密码', true);
+            setError('login.pass.wrong');
+            showRoomInfo('login.room.needpass2', true, serverRoom || roomInUrl);
             try { passInput.focus(); } catch (e) { /* 忽略 */ }
             return;
         }
 
-        loginError.textContent = (data && data.msg) || '登录失败';
+        // 后端给的 msg 是中文，切了语言也没法变 —— 已知 code 一律用本地文案
+        setErrorRaw(loginFailureText(code, data && data.msg));
         setBusy(false, '');
         applyRoomLock(code === 'ROOM_LOCKED');
 
@@ -556,7 +910,7 @@
     function applyRoomLock(locked) {
         if (lockNotice) lockNotice.style.display = locked ? 'block' : 'none';
         if (!loggedIn && locked && !loginError.textContent) {
-            loginInfo.textContent = '房间已锁定，只有原有玩家可以用原名称重连';
+            setInfo('login.locked.info');
         }
     }
 
@@ -573,12 +927,12 @@
 
         if (savedName && savedToken) {
             nameInput.value = savedName;
-            setBusy(true, '正在自动登录...');
+            setBusy(true, 'login.busy.auto');
             attemptLogin(savedName);
         } else {
             if (savedName) nameInput.value = savedName;
             if (!loginInfo.textContent) {
-                loginInfo.textContent = savedName ? '请输入名称后进入' : '请输入你的名称';
+                setInfo(savedName ? 'login.hint.saved' : 'login.hint');
             }
         }
     }
@@ -1327,12 +1681,40 @@
         if (!visible) closeFabMenu();
     }
 
+    /**
+     * 按"登没登录"调整悬浮菜单：
+     *   没登录 → 按钮也在（登录页就能改语言，不然看不懂中文的人连菜单都进不去），
+     *           但根菜单里只有「设置」，没有「退出房间」。
+     *   已登录 → 两项都在。
+     */
+    function updateFabForLogin() {
+        setFabVisible(true);
+        if (exitBtn) exitBtn.style.display = loggedIn ? '' : 'none';
+        if (menuOpen()) placeFabMenu();
+    }
+
     function menuOpen() {
         return !fabMenu.classList.contains('fab-hidden');
     }
 
     function closeFabMenu() {
         fabMenu.classList.add('fab-hidden');
+    }
+
+    /**
+     * 切菜单页：root（设置 / 退出房间）→ settings（语言）→ language（语言列表）。
+     * 面板尺寸会跟着变，所以切完要重新摆一次（和"打开时先量尺寸"是同一个理由）。
+     */
+    let menuPage = 'root';
+
+    function showMenuPage(name) {
+        menuPage = name;
+        const pages = fabMenu.querySelectorAll('[data-page]');
+        for (let i = 0; i < pages.length; i++) {
+            const mine = pages[i].getAttribute('data-page') === name;
+            pages[i].classList.toggle('fab-hidden', !mine);
+        }
+        if (menuOpen()) placeFabMenu();
     }
 
     /**
@@ -1359,6 +1741,8 @@
     }
 
     function openFabMenu() {
+        showMenuPage('root');           // 每次打开都从第一级开始
+        applyI18n();                    // 顺手把菜单文字刷成当前语言（列表也要重排）
         fabMenu.classList.remove('fab-hidden');
         // 先摆到边上再量尺寸，量到的是真实宽高，最后再摆一次到正确位置
         fabMenu.style.left = FAB_MARGIN + 'px';
@@ -1451,6 +1835,14 @@
         closeFabMenu();
     }, { passive: true });
 
+    if (settingsBtn) settingsBtn.addEventListener('click', () => { showMenuPage('settings'); });
+    if (languageBtn) languageBtn.addEventListener('click', () => { showMenuPage('language'); });
+
+    // 两个「返回」按钮：data-back 指向要回的那一页
+    Array.prototype.forEach.call(fabMenu.querySelectorAll('[data-back]'), (btn) => {
+        btn.addEventListener('click', () => { showMenuPage(btn.getAttribute('data-back')); });
+    });
+
     exitBtn.addEventListener('click', () => { exitRoom(); });
 
     /**
@@ -1468,23 +1860,22 @@
         const room = serverRoom || roomInUrl || getCookie(COOKIE_ROOM) || '';
 
         exitBtn.disabled = true;
-        exitBtn.textContent = '正在退出…';
+        exitBtn.textContent = T('exit.doing');
 
         postWithTimeout('/api/leave', { room: room, name: name, token: token }, 4000)
             .then((res) => {
-                if (res && res.success) return finishExit('已退出房间');
-                if (res && res.code === 'ROOM_GONE') return finishExit('房间已不在，已在本地退出');
-                if (res && res.message) return finishExit(res.message + '（已在本地退出）');
-                return finishExit('已退出房间');
+                if (res && res.code === 'ROOM_GONE') return finishExit('exit.gone');
+                // 服务器说成功、或者说"名册里没有你"——对玩家都是"已经退出"。
+                // 服务器那句 message 是中文，这里不再直接用它。
+                return finishExit('exit.done');
             })
-            .catch(() => finishExit('房间已离线，已在本地退出'));
+            .catch(() => finishExit('exit.offline'));
     }
 
-    function finishExit(message) {
+    function finishExit(key, a) {
         exitBtn.disabled = false;
-        exitBtn.textContent = '退出房间';
+        exitBtn.textContent = T('fab.exit');
         closeFabMenu();
-        setFabVisible(false);
 
         // 清掉 token 与房间号（**名字留着**，重新加入时少打一次）
         clearRoomIdentity();
@@ -1494,20 +1885,22 @@
         loggedIn = false;
         exited = true;
         playerName = '';
+        updateFabForLogin();
         toolbar.style.display = 'none';
-        displayName.textContent = '未知';
+        displayName.textContent = T('common.unknown');
 
         try { socket.close(); } catch (e) { /* 已经关了 */ }
 
         loginOverlay.style.display = 'flex';
-        loginError.textContent = '';
+        setError('');
         setBusy(false, '');
         showRoomInfo('', false);
         if (!nameInput.value.trim()) {
             const savedName = getCookie(COOKIE_NAME);
             if (savedName) nameInput.value = savedName;
         }
-        loginInfo.textContent = message + '　点「进入」重新加入。';
+        infoState = { exitKey: key, a: a };
+        renderInfo();
     }
 
     // ---------- 顶部胶囊提示（"xxx 离开了房间"） ----------
@@ -1533,19 +1926,17 @@
     }
 
     socket.on('player_left', (data) => {
-        const who = (data && data.name) ? data.name : '有玩家';
-        showToast(who + ' 离开了房间', 2000);
+        const who = (data && data.name) ? data.name : T('toast.anon');
+        showToast(T('toast.left', who), 2000);
     });
 
     // ---------- 连接状态 ----------
     socket.on('disconnect', () => {
-        statusEl.textContent = '● 离线';
-        statusEl.style.color = OFFLINE_COLOR;
+        refreshConnectionStatus();
     });
 
     socket.on('connect', () => {
-        statusEl.textContent = '● 在线';
-        statusEl.style.color = ONLINE_COLOR;
+        refreshConnectionStatus();
         if (!loggedIn) autoLogin();
         else relogin();
     });
@@ -1566,7 +1957,7 @@
     // 服务器换了 IP/端口：跟随新地址刷新
     socket.on('server_moved', (data) => {
         if (data && data.playerUrl) {
-            setBusy(true, '服务器地址已更新，正在重新连接...');
+            setBusy(true, 'server.moved');
             setTimeout(() => { window.location.href = data.playerUrl; }, 800);
         }
     });
@@ -1575,9 +1966,9 @@
     socket.on('kicked', () => {
         loggedIn = false;
         loginOverlay.style.display = 'flex';
-        loginError.textContent = '你已被 DM 踢出游戏';
-        setBusy(false, '可用原名称重新进入');
-        try { alert('你已被DM踢出游戏'); } catch { /* 某些浏览器会拦截 alert */ }
+        setError('kick.error');
+        setBusy(false, 'kick.info');
+        try { alert(T('kick.alert')); } catch { /* 某些浏览器会拦截 alert */ }
     });
 
     // 启动
@@ -1588,6 +1979,10 @@
 
     // `/join` 页多给一个房间号输入框（密码框由 updatePasswordField 一直亮着，所以是三个框）。
     if (JOIN_MODE && roomNumInput) roomNumInput.style.display = 'block';
+
+    // 先把界面文字按当前语言填一遍（含语言列表与状态条），再问房间
+    applyI18n();
+    updateFabForLogin();      // 登录页也能打开「设置 → 语言」
 
     setupOrientationDebug();
     applyRotation();

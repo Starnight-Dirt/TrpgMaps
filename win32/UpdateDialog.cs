@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Drawing;
 using System.Windows.Forms;
 
@@ -22,7 +22,7 @@ namespace TrpgMaps
 
         private UpdateDialog(UpdateManifest manifest, string source)
         {
-            Text = "发现新版本";
+            Text = Loc.T("update.title");
             FormBorderStyle = FormBorderStyle.FixedDialog;
             StartPosition = FormStartPosition.CenterParent;
             MaximizeBox = false;
@@ -34,7 +34,7 @@ namespace TrpgMaps
             ClientSize = new Size(470, 252);
 
             var title = new Label();
-            title.Text = "发现新版本";
+            title.Text = Loc.T("update.title");
             title.Font = Ui.Font(13f, FontStyle.Bold);
             title.ForeColor = Color.White;
             title.BackColor = Color.Transparent;
@@ -43,7 +43,7 @@ namespace TrpgMaps
             Controls.Add(title);
 
             var versions = new Label();
-            versions.Text = "当前版本 " + AppInfo.VersionText + "   →   最新版本 v" + manifest.Version;
+            versions.Text = Loc.T("update.dialog.current", AppInfo.VersionText, manifest.Version);
             versions.ForeColor = Theme.Success;
             versions.BackColor = Color.Transparent;
             versions.AutoSize = false;
@@ -52,7 +52,7 @@ namespace TrpgMaps
 
             var notes = new Label();
             notes.Text = string.IsNullOrEmpty(manifest.Notes)
-                ? "仓库里有比本机更新的版本，建议更新到最新版。"
+                ? Loc.T("update.dialog.notes")
                 : manifest.Notes;
             notes.ForeColor = Theme.TextDim;
             notes.BackColor = Color.Transparent;
@@ -61,26 +61,25 @@ namespace TrpgMaps
             Controls.Add(notes);
 
             var hint = new Label();
-            hint.Text = "更新来源：" + (string.IsNullOrEmpty(source) ? "自动" : source) +
-                        "　　升级包会从发布页（releases）下载。\r\n" +
-                        "便携版只覆盖程序文件；安装版还会顺带修正注册信息。";
+            hint.Text = Loc.T("update.dialog.source",
+                string.IsNullOrEmpty(source) ? Loc.T("update.dialog.auto") : source);
             hint.ForeColor = Theme.TextDim;
             hint.BackColor = Color.Transparent;
             hint.AutoSize = false;
             hint.SetBounds(20, 144, 430, 44);
             Controls.Add(hint);
 
-            var never = MakeButton("不再提示", false);
+            var never = MakeButton(Loc.T("update.dialog.never"), false);
             never.SetBounds(20, 202, 104, 32);
             never.Click += delegate { _choice = ChoiceNever; DialogResult = DialogResult.OK; };
             Controls.Add(never);
 
-            var later = MakeButton("下次一定", false);
+            var later = MakeButton(Loc.T("update.later"), false);
             later.SetBounds(238, 202, 104, 32);
             later.Click += delegate { _choice = ChoiceLater; DialogResult = DialogResult.OK; };
             Controls.Add(later);
 
-            var update = MakeButton("更新", true);
+            var update = MakeButton(Loc.T("update.update"), true);
             update.SetBounds(350, 202, 100, 32);
             update.Click += delegate { _choice = ChoiceUpdate; DialogResult = DialogResult.OK; };
             Controls.Add(update);
@@ -161,7 +160,7 @@ namespace TrpgMaps
             Controls.Add(body);
 
             var ok = new ModernButton();
-            ok.Text = "知道了";
+            ok.Text = Loc.T("update.dialog.ok");
             ok.BackColor = Theme.Accent;
             ok.ForeColor = Color.White;
             ok.Font = Ui.Font(9.5f);
@@ -237,7 +236,7 @@ namespace TrpgMaps
                     catch (Exception ex)
                     {
                         AppLog.Write("后台任务出错", ex);
-                        SetStatus("出错了：" + ex.Message);
+                        SetStatus(Loc.T("busy.error", ex.Message));
                     }
                     finally
                     {

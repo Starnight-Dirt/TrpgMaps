@@ -31,9 +31,14 @@
 #   closeall     - everything closed
 #   gridreopen   - map panel reopened (the slider must still read 3.5)
 #   net          - sidebar expanded + network panel
+#   audio        - sidebar expanded + audio panel (track tree / seek / lyrics)
+#   fsa / fsb    - fullscreen round-trip step 1 / step 2 (the "rest of the window is
+#                  transparent after going fullscreen" regression)
+#   toast        - the top capsule "xxx left the room" frozen mid-slide
 #   rotate90     - map panel open with the basemap turned 90 degrees clockwise
 #   gridcolor    - map panel open with a basemap selected, grid colour left on "auto"
 #   draw         - drawing panel open (top-right float window), first terrain asset picked
+#   drawentity   - drawing panel on the Entity tab, every folder expanded (the multi-level menu)
 #   drawbrush    - drawing panel in brush mode with an origin placed and a live selection
 #   drawcone     - same, but the brush shape is the fan/cone (blue sector instead of a circle)
 #   drawbrushloose - same as drawbrush, but the selection mode is Loose: every cell the shape
@@ -44,7 +49,7 @@
 param(
     [string]$Exe = '',
 
-    [ValidateSet('all', 'base', 'sidebar', 'map', 'mapcollapsed', 'grid35', 'closeall', 'gridreopen', 'net', 'about', 'rotate90', 'gridcolor', 'draw', 'drawbrush', 'drawcone', 'drawbrushloose', 'drawtangent')]
+    [ValidateSet('all', 'base', 'sidebar', 'map', 'mapcollapsed', 'grid35', 'closeall', 'gridreopen', 'net', 'about', 'audio', 'rotate90', 'gridcolor', 'draw', 'drawentity', 'drawbrush', 'drawcone', 'drawbrushloose', 'drawtangent', 'fsa', 'fsb', 'toast')]
     [string]$Mode = 'all',
 
     [string]$Out = '',

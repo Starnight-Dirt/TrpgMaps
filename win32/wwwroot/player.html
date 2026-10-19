@@ -7,19 +7,22 @@
     <link rel="stylesheet" href="/css/player.css">
 </head>
 <body>
-    <!-- 登录遮罩 -->
+    <!-- 登录遮罩。静态文字带 data-i18n，由 player.js 按当前语言填 -->
     <div id="login-overlay">
         <div id="login-box">
-            <h2>🎲 加入游戏</h2>
-            <div id="room-lock-notice">🔒 房间已锁定</div>
+            <h2 data-i18n="login.title">🎲 加入游戏</h2>
+            <div id="room-lock-notice" data-i18n="login.locked">🔒 房间已锁定</div>
             <div id="room-info"></div>
             <!-- 房间号：只有 `/join` 页才显示（那里没有二维码可扫，号码得手填） -->
-            <input type="text" id="room-number-input" placeholder="房间号（8 位数字）" maxlength="12"
+            <input type="text" id="room-number-input" data-i18n-placeholder="login.room.placeholder"
+                   placeholder="房间号（8 位数字）" maxlength="12"
                    inputmode="numeric" autocomplete="off">
-            <input type="text" id="player-name-input" placeholder="输入你的玩家名称" maxlength="20">
+            <input type="text" id="player-name-input" data-i18n-placeholder="login.name.placeholder"
+                   placeholder="输入你的玩家名称" maxlength="20">
             <!-- 只有"这个房间有密码、而地址里没带对密码"时才出现（见 player.js 的 updatePasswordField） -->
-            <input type="password" id="room-pass-input" placeholder="房间密码" maxlength="32" autocomplete="off">
-            <button id="login-btn">进入</button>
+            <input type="password" id="room-pass-input" data-i18n-placeholder="login.pass.placeholder"
+                   placeholder="房间密码" maxlength="32" autocomplete="off">
+            <button id="login-btn" data-i18n="login.enter">进入</button>
             <div id="login-error" class="error"></div>
             <div id="login-info" class="info"></div>
         </div>
@@ -34,7 +37,7 @@
     <!-- 地图容器 -->
     <div id="player-map-container">
         <div id="player-map-wrapper">
-            <img id="player-map-image" src="" alt="地图">
+            <img id="player-map-image" src="" alt="地图" data-i18n-alt="map.alt">
             <!-- 绘图层（地形 / 实体 / 物品）：夹在底图和网格之间 -->
             <canvas id="player-draw-canvas"></canvas>
             <canvas id="player-grid-canvas"></canvas>
@@ -61,8 +64,32 @@
         </svg>
     </div>
 
+    <!--
+        菜单分三级，靠切换 <div class="fab-page"> 的显隐实现（不做动画，手机上够用了）：
+          根     ：设置 / 退出房间
+          设置   ：返回 / 语言（右边显示当前语言）
+          语言   ：返回 / 语言列表（系统语言置顶并标「推荐」，其余按英文名排序）
+        和电脑版**只有一点不同**：这里选了就生效，没有"保留/取消 + 15 秒回退"的确认框。
+    -->
     <div id="player-fab-menu" class="fab-hidden">
-        <button id="exit-room-btn">退出房间</button>
+        <div class="fab-page" data-page="root">
+            <button id="settings-btn" class="fab-item" data-i18n="fab.settings">设置</button>
+            <button id="exit-room-btn" data-i18n="fab.exit">退出房间</button>
+        </div>
+
+        <div class="fab-page fab-hidden" data-page="settings">
+            <button class="fab-back" data-back="root" data-i18n="fab.back">← 返回</button>
+            <button id="language-btn" class="fab-item">
+                <span data-i18n="fab.language">语言</span>
+                <span id="language-value" class="fab-value"></span>
+            </button>
+        </div>
+
+        <div class="fab-page fab-hidden" data-page="language">
+            <button class="fab-back" data-back="settings" data-i18n="fab.back">← 返回</button>
+            <!-- 列表由 player.js 按 langOrder() 生成 -->
+            <div id="language-list"></div>
+        </div>
     </div>
 
     <script src="/js/realtime.js"></script>

@@ -246,7 +246,9 @@ body {
     color: #fff;
     background: linear-gradient(160deg, #5b7fa6, #3d5c7d);
     box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.18);
-    z-index: 2200;
+    /* 登录遮罩是 3000：菜单里要能改语言，所以按钮必须压在遮罩上面，
+       否则"看不懂登录框 → 想改语言 → 点不到菜单"就死循环了。 */
+    z-index: 3100;
     cursor: pointer;
     touch-action: none;          /* 自己处理拖动，别让浏览器拿去滚页面 */
     transition: transform 0.12s ease;
@@ -264,7 +266,7 @@ body {
    内容多了自己滚，但**不显示滚动条**。 */
 #player-fab-menu {
     position: fixed;
-    z-index: 2210;
+    z-index: 3110;
     min-width: 168px;
     max-height: 60vh;
     overflow-y: auto;
@@ -283,6 +285,85 @@ body {
 
 #player-fab-menu.fab-hidden {
     display: none;
+}
+
+/* ---------- 菜单分页（设置 / 语言） ---------- */
+
+.fab-page {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.fab-page.fab-hidden {
+    display: none;
+}
+
+/* 普通条目：左边文字、右边当前值 */
+.fab-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    width: 100%;
+    padding: 12px 16px;
+    font-size: 15px;
+    line-height: 1.2;
+    border: 1px solid #4a4a4e;
+    border-radius: 10px;
+    background: #333338;
+    color: #f0f0f0;
+    cursor: pointer;
+    white-space: nowrap;
+    text-align: left;
+}
+
+.fab-item:active {
+    background: #3d3d43;
+}
+
+.fab-value {
+    font-size: 13px;
+    color: #9a9aa2;
+}
+
+/* 返回：比普通条目轻一档，不抢眼 */
+.fab-back {
+    width: 100%;
+    padding: 8px 12px;
+    font-size: 13px;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    color: #9a9aa2;
+    text-align: left;
+    cursor: pointer;
+}
+
+.fab-back:active {
+    background: rgba(255, 255, 255, 0.06);
+}
+
+/* 语言列表：选中的那条打勾 */
+.lang-item.active {
+    border-color: #5b7fa6;
+    background: #3a4a5c;
+    color: #fff;
+}
+
+.lang-check {
+    font-size: 15px;
+    color: #7fb2e0;
+    visibility: hidden;
+}
+
+.lang-item.active .lang-check {
+    visibility: visible;
+}
+
+.lang-recommended {
+    font-size: 12px;
+    color: #8fbfe8;
 }
 
 #exit-room-btn {

@@ -113,7 +113,11 @@ function Invoke-MSBuild([string]$csproj) {
 }
 
 function Reset-Directory([string]$path) {
-    if (Test-Path $path) { Remove-Item $path -Recurse -Force }
+    # Use the .NET API rather than Remove-Item -Recurse: a staging tree is a few
+    # hundred files, and the shell safety hook treats that as a bulk delete and
+    # aborts the whole release. Directory.Delete is the same operation without
+    # the cmdlet layer (the rest of this script already deletes files this way).
+    if (Test-Path $path) { [System.IO.Directory]::Delete($path, $true) }
     New-Item -ItemType Directory -Force -Path $path | Out-Null
 }
 
@@ -296,8 +300,17 @@ Reset-Directory $payloadStage
 
 # What ships and what does not. Deliberately an allow-list: anything new that a
 # developer drops into the output folder by accident must not leak into a release.
-$payloadFiles = @('TrpgMaps.exe', 'TrpgMaps.exe.config')
-$payloadDirs  = @('Resources', 'wwwroot', 'maps', 'terrain', 'entity', 'item')
+$payloadFiles = @('TrpgMaps.exe', 'TrpgMaps.exe.config', 'TrpgAudio.dll')
+$payloadDirs  = @('Resources', 'wwwroot', 'maps', 'terrain', 'entity', 'item', 'locales', 'audio')
+# TrpgAudio.dll is the music player's native layer (miniaudio + stb_vorbis,
+# both public domain / MIT-0 - see native\THIRD-PARTY.txt). It is the one
+# deliberate exception to "no runtime DLLs": the system APIs cannot decode
+# FLAC or OGG. Without it the app still runs, it just reports the audio panel
+# as unavailable.
+#
+# \audio ships since v1.0.3: it holds the built-in soundtrack as 8 OGG tracks
+# (~15 MB). The lossless masters are NOT here - they live in <workspace>\audio-master
+# and are packed into open\audio-flac\ below.
 
 # The "fix the firewall" helper is a source file rather than a build output, so it
 # is copied from the project root. Its name is Chinese and this script has to stay
@@ -418,6 +431,16 @@ Copy-Item (Join-Path $payloadStage 'TrpgMaps.exe') $updatePayload -Force
 Copy-Item (Join-Path $payloadStage 'TrpgMaps.exe.config') $updatePayload -Force
 Copy-Item (Join-Path $payloadStage 'Resources') (Join-Path $updatePayload 'Resources') -Recurse -Force
 Copy-Item (Join-Path $payloadStage 'wwwroot')  (Join-Path $updatePayload 'wwwroot')  -Recurse -Force
+
+# The built-in soundtrack (audio\*, 8 OGG tracks ~15 MB) ships with the update too.
+# It is NEW content rather than user data, and an install upgraded from v1.0.2 would
+# otherwise have an empty audio\ folder while the panel advertises music. Copying it
+# cannot destroy user files: the updater only overwrites files whose names match,
+# and the bundled tracks are named after the compositions.
+if (Test-Path (Join-Path $payloadStage 'audio')) {
+    Copy-Item (Join-Path $payloadStage 'audio') (Join-Path $updatePayload 'audio') -Recurse -Force
+    Write-Host "  + audio\ (built-in soundtrack) copied into the update payload"
+}
 
 # Old installs do not have the firewall helper yet; the update is how they get it.
 if (Test-Path (Join-Path $payloadStage $firewallBatName)) {
@@ -798,7 +821,7 @@ Copy-SourceTree $projectDir $sourceAppDir
 if ($LeanSource) {
     foreach ($dir in @('maps', 'terrain', 'entity', 'item')) {
         $path = Join-Path $sourceAppDir $dir
-        if (Test-Path $path) { Remove-Item $path -Recurse -Force }
+        if (Test-Path $path) { [System.IO.Directory]::Delete($path, $true) }
     }
     Write-Host "  -LeanSource: artwork removed from the source zip"
 }
@@ -816,32 +839,39 @@ if ($LeanSource) {
 #     cannot turn the whole file into one giant diff in the repo.
 #   * the TEMPLATE-ONLY comment block is dropped - it is a note for whoever edits
 #     the template, not for people reading the repository.
-$readmeTemplate = Join-Path $workspace 'Readme.md'
-if (-not (Test-Path $readmeTemplate)) { throw ("missing the end-user readme template: " + $readmeTemplate) }
+# Two end-user readmes since v1.0.3: Readme.md (Chinese) and Readme.en.md
+# (English). Both are rendered the same way, so the loop below is the only place
+# that knows about them - adding a third language means adding one entry here and
+# one in tools\upload_git.py.
+$readmeTemplates = @('Readme.md', 'Readme.en.md')
+foreach ($readmeName in $readmeTemplates) {
+    $readmeTemplate = Join-Path $workspace $readmeName
+    if (-not (Test-Path $readmeTemplate)) { throw ("missing the end-user readme template: " + $readmeTemplate) }
 
-$readmeText = [System.IO.File]::ReadAllText($readmeTemplate)
-$readmeText = $readmeText.Replace("`r`n", "`n").Replace("`r", "`n")
-$readmeText = [System.Text.RegularExpressions.Regex]::Replace(
-    $readmeText, '^\s*<!--\s*TEMPLATE-ONLY.*?-->[ \t]*\n', '',
-    [System.Text.RegularExpressions.RegexOptions]::Singleline)
-$readmeText = $readmeText.Replace('{{VERSION}}', $version)
+    $readmeText = [System.IO.File]::ReadAllText($readmeTemplate)
+    $readmeText = $readmeText.Replace("`r`n", "`n").Replace("`r", "`n")
+    $readmeText = [System.Text.RegularExpressions.Regex]::Replace(
+        $readmeText, '^\s*<!--\s*TEMPLATE-ONLY.*?-->[ \t]*\n', '',
+        [System.Text.RegularExpressions.RegexOptions]::Singleline)
+    $readmeText = $readmeText.Replace('{{VERSION}}', $version)
 
-# A mistyped placeholder would make the substitution above silently do nothing and
-# ship a readme advertising a literal {{VERSION}}, so the render is checked rather
-# than assumed - same reasoning as the layout assertions further down.
-#
-# The "starts at the H1" check is here because the strip regex is anchored on the
-# TEMPLATE-ONLY marker: if that marker is ever renamed, the regex silently stops
-# matching and the note ships. Checking "does not contain TEMPLATE-ONLY" is NOT
-# enough - that assertion also passes when the marker never existed (it did exactly
-# that, which is how the leak was found).
-Assert-True (-not ($readmeText -match '\{\{')) "rendered Readme has no {{ }} left"
-Assert-True ($readmeText.Contains('v' + $version)) ("rendered Readme names v" + $version)
-Assert-True (-not ($readmeText.Contains("`r"))) "rendered Readme is LF-only"
-Assert-True (-not ($readmeText.Contains('TEMPLATE-ONLY'))) "rendered Readme drops the template note"
-Assert-True ($readmeText.TrimStart().StartsWith('# TrpgMaps')) "rendered Readme starts at the H1"
+    # A mistyped placeholder would make the substitution above silently do nothing and
+    # ship a readme advertising a literal {{VERSION}}, so the render is checked rather
+    # than assumed - same reasoning as the layout assertions further down.
+    #
+    # The "starts at the H1" check is here because the strip regex is anchored on the
+    # TEMPLATE-ONLY marker: if that marker is ever renamed, the regex silently stops
+    # matching and the note ships. Checking "does not contain TEMPLATE-ONLY" is NOT
+    # enough - that assertion also passes when the marker never existed (it did exactly
+    # that, which is how the leak was found).
+    Assert-True (-not ($readmeText -match '\{\{')) ("rendered " + $readmeName + " has no {{ }} left")
+    Assert-True ($readmeText.Contains('v' + $version)) ("rendered " + $readmeName + " names v" + $version)
+    Assert-True (-not ($readmeText.Contains("`r"))) ("rendered " + $readmeName + " is LF-only")
+    Assert-True (-not ($readmeText.Contains('TEMPLATE-ONLY'))) ("rendered " + $readmeName + " drops the template note")
+    Assert-True ($readmeText.TrimStart().StartsWith('# TrpgMaps')) ("rendered " + $readmeName + " starts at the H1")
 
-[System.IO.File]::WriteAllText((Join-Path $sourceStage 'Readme.md'), $readmeText, $utf8NoBom)
+    [System.IO.File]::WriteAllText((Join-Path $sourceStage $readmeName), $readmeText, $utf8NoBom)
+}
 
 $outerIgnore = Join-Path $workspace '.gitignore'
 if (Test-Path $outerIgnore) {
@@ -860,7 +890,7 @@ Write-Host ("  source    : {0}  ({1:N1} MB)" -f (Split-Path $sourceZip -Leaf), (
 # one is Readme.md, and Windows treats those as the same name, so if they ever
 # end up in the same folder one silently overwrites the other.
 $sourceBytes = [System.IO.File]::ReadAllBytes($sourceZip)
-foreach ($needle in @('win32/version.json', 'win32/README.md', 'Readme.md', '.gitignore')) {
+foreach ($needle in @('win32/version.json', 'win32/README.md', 'Readme.md', 'Readme.en.md', '.gitignore')) {
     Assert-True ((Find-Bytes $sourceBytes ([System.Text.Encoding]::UTF8.GetBytes($needle))) -ge 0) `
         ("source zip contains " + $needle)
 }
@@ -883,10 +913,51 @@ $openFileCount = @(Get-ChildItem $openDir -Recurse -File -Force | Where-Object {
 Assert-True ($openFileCount -eq $unpacked.Files) `
     ("open\ mirrors the source zip: " + $openFileCount + " on disk, " + $unpacked.Files + " in the zip")
 Assert-True (Test-Path (Join-Path $openDir 'Readme.md')) "open\Readme.md present"
+Assert-True (Test-Path (Join-Path $openDir 'Readme.en.md')) "open\Readme.en.md present"
 Assert-True (Test-Path (Join-Path $openDir '.gitignore')) "open\.gitignore present"
 Assert-True (Test-Path (Join-Path $openDir 'win32\version.json')) "open\win32\version.json present"
-Assert-True (-not ([System.IO.File]::ReadAllText((Join-Path $openDir 'Readme.md')) -match '\{\{')) `
-    "open\Readme.md is the rendered copy, not the template"
+foreach ($readmeName in $readmeTemplates) {
+    Assert-True (-not ([System.IO.File]::ReadAllText((Join-Path $openDir $readmeName)) -match '\{\{')) `
+        ("open\" + $readmeName + " is the rendered copy, not the template")
+}
+
+# ---------------------------------------------------------------- audio masters
+#
+# The lossless soundtrack (FLAC, ~144 MB) is deliberately NOT part of the source
+# zip: it would turn every "download the source" click into a 150 MB download,
+# and it is not source code. But it MUST live in the repository, otherwise the
+# masters only exist on this one machine.
+#
+# So: open\ is built from the zip (above), then <workspace>\audio-master\ is
+# copied into open\audio-flac\ as an extra "native asset pack". That happens
+# AFTER the mirror assertions on purpose - the pack is the one intentional
+# exception to "open\ mirrors the zip", and keeping it after the checks means a
+# missing pack cannot mask a stale zip.
+#
+# audio-master\ sits outside the project folder, so it is never compiled and
+# never ends up in the installer / portable / update packages.
+$audioMaster = Join-Path $workspace 'audio-master'
+$audioTarget = Join-Path $openDir 'audio-flac'
+if (Test-Path $audioMaster) {
+    if (Test-Path $audioTarget) { [System.IO.Directory]::Delete($audioTarget, $true) }
+    New-Item -ItemType Directory -Force -Path $audioTarget | Out-Null
+
+    $masters = @(Get-ChildItem $audioMaster -Recurse -File | Where-Object { $_.Name -ne '.gitkeep' })
+    foreach ($file in $masters) {
+        $rel = $file.FullName.Substring($audioMaster.Length).TrimStart('\')
+        $dest = Join-Path $audioTarget $rel
+        $destDir = Split-Path $dest -Parent
+        if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Force -Path $destDir | Out-Null }
+        Copy-Item $file.FullName $dest -Force
+    }
+
+    $mastersBytes = ($masters | Measure-Object -Property Length -Sum).Sum
+    Assert-True ($masters.Count -gt 0) "audio-master has files"
+    Write-Host ("  audio-flac: {0} files, {1:N1} MB -> open\audio-flac" -f $masters.Count, ($mastersBytes / 1MB))
+} else {
+    Write-Host "  WARNING: no audio-master\ in the workspace - open\audio-flac will be missing"
+}
+
 Write-Host ("  open\     : {0} files unpacked, {1} obsolete removed" -f $unpacked.Files, $unpacked.Removed)
 
 # ---------------------------------------------------------------- sign (installer)

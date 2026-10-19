@@ -853,15 +853,38 @@ namespace TrpgMaps
         private int _hover = -1;
         private int _offset;
         private int _maxOffset;
+        private int _xOffset;
+        private int _maxXOffset;
+        private int _contentWidth;
+        private int[] _rowTops = new int[1];
         private bool _thumbHover;
         private bool _thumbDrag;
+        private bool _hThumbHover;
+        private bool _hThumbDrag;
         private int _dragOriginY;
         private int _dragOriginOffset;
+        private int _dragOriginX;
+        private int _dragOriginXOffset;
 
         public ListItemDrawHandler ItemDraw;
 
+        /// <summary>
+        /// 可选：每个条目自己的行高（返回 ≤0 时退回 <see cref="ItemHeight"/>）。
+        /// 素材树用它 —— 文件夹行只有 30px，图片行还是 50px。
+        /// </summary>
+        public Func<object, int> RowHeight;
+
+        /// <summary>
+        /// 可选：这一项能不能被"选中"。返回 false 的项（比如文件夹）点下去只发
+        /// <see cref="ItemClicked"/>，不会亮起选中态。
+        /// </summary>
+        public Predicate<object> CanSelectItem;
+
         public event EventHandler SelectedIndexChanged;
         public event EventHandler ItemActivated;
+
+        /// <summary>点中某一项（不管能不能选中）。文件夹的展开/折叠走这个事件。</summary>
+        public event Action<object> ItemClicked;
 
         public ModernList()
         {
@@ -879,6 +902,7 @@ namespace TrpgMaps
         public int Count { get { return _items.Count; } }
         public bool RoundedRows;
         public bool ScrollbarVisible { get { return _maxOffset > 0; } }
+        public int ScrollOffset { get { return _offset; } }
         public int OverflowHeight { get { return _maxOffset; } }
 
         public int ItemHeight
@@ -887,10 +911,30 @@ namespace TrpgMaps
             set
             {
                 _itemHeight = Math.Max(16, value);
+                RebuildRows();
                 UpdateScroll();
                 Invalidate();
             }
         }
+
+        /// <summary>
+        /// 内容宽度。设成 &gt;0 且超出可视区时，底部出现一条**和竖向同风格**的
+        /// 4px 横向滚动条；保持 0 则永远没有横向滚动条（老列表的行为不变）。
+        /// </summary>
+        public int ContentWidth
+        {
+            get { return _contentWidth; }
+            set
+            {
+                var v = Math.Max(0, value);
+                if (v == _contentWidth) return;
+                _contentWidth = v;
+                UpdateScroll();
+                Invalidate();
+            }
+        }
+
+        public bool HorizontalScrollbarVisible { get { return _maxXOffset > 0; } }
 
         public int SelectedIndex
         {
@@ -928,22 +972,59 @@ namespace TrpgMaps
             RefreshItems();
         }
 
-        /// <summary>增删条目之后调用，重算滚动范围。</summary>
+        /// <summary>增删条目之后调用，重算行高与滚动范围。</summary>
         public void RefreshItems()
         {
             if (_selected >= _items.Count) _selected = -1;
+            RebuildRows();
             UpdateScroll();
             Invalidate();
         }
 
+        private int HeightOf(int index)
+        {
+            if (RowHeight != null)
+            {
+                var h = RowHeight(_items[index]);
+                if (h > 0) return h;
+            }
+            return _itemHeight;
+        }
+
+        /// <summary>行首位置的前缀和：_rowTops[i] 是第 i 行的顶端，末位是总高度。</summary>
+        private void RebuildRows()
+        {
+            var tops = new int[_items.Count + 1];
+            for (var i = 0; i < _items.Count; i++) tops[i + 1] = tops[i] + HeightOf(i);
+            _rowTops = tops;
+        }
+
+        private int ContentHeight
+        {
+            get { return _rowTops.Length > 0 ? _rowTops[_rowTops.Length - 1] : 0; }
+        }
+
+        private int BottomReserve { get { return _maxXOffset > 0 ? BarWidth + BarInset : 0; } }
+
         private void UpdateScroll()
         {
-            var needed = _items.Count * _itemHeight;
+            if (_rowTops.Length != _items.Count + 1) RebuildRows();
+
             var viewport = ClientSize.Height;
-            _maxOffset = needed > viewport ? needed - viewport : 0;
+            _maxOffset = Math.Max(0, ContentHeight - viewport);
+
+            // 先算横向：竖向条会占掉右边一条，可用宽度要减掉
+            var reserveRight = _maxOffset > 0 ? BarWidth + BarInset : 0;
+            var viewportWidth = ClientSize.Width - reserveRight;
+            _maxXOffset = _contentWidth > 0 ? Math.Max(0, _contentWidth - viewportWidth) : 0;
+
+            // 横向条出现后，可视高度变小，竖向范围要重算一次
+            if (_maxXOffset > 0) _maxOffset = Math.Max(0, ContentHeight - (viewport - BottomReserve));
 
             if (_offset > _maxOffset) _offset = _maxOffset;
             if (_offset < 0) _offset = 0;
+            if (_xOffset > _maxXOffset) _xOffset = _maxXOffset;
+            if (_xOffset < 0) _xOffset = 0;
         }
 
         public void SetOffset(int value)
@@ -956,6 +1037,16 @@ namespace TrpgMaps
             Invalidate();
         }
 
+        public void SetXOffset(int value)
+        {
+            if (value < 0) value = 0;
+            if (value > _maxXOffset) value = _maxXOffset;
+            if (value == _xOffset) return;
+
+            _xOffset = value;
+            Invalidate();
+        }
+
         protected override void OnResize(EventArgs e)
         {
             base.OnResize(e);
@@ -965,20 +1056,44 @@ namespace TrpgMaps
         private int IndexAtY(int y)
         {
             if (_items.Count == 0) return -1;
-            var index = (y + _offset) / _itemHeight;
-            if (index < 0 || index >= _items.Count) return -1;
-            return index;
+            var pos = y + _offset;
+            var lo = 0;
+            var hi = _items.Count - 1;
+            while (lo <= hi)
+            {
+                var mid = (lo + hi) / 2;
+                if (pos < _rowTops[mid]) hi = mid - 1;
+                else if (pos >= _rowTops[mid + 1]) lo = mid + 1;
+                else return mid;
+            }
+            return -1;
         }
+
+        /// <summary>第一个"底端还在可视区下方"的行号（绘制时从头开始扫）。</summary>
+        private int FirstVisibleRow()
+        {
+            var lo = 0;
+            var hi = _items.Count;
+            while (lo < hi)
+            {
+                var mid = (lo + hi) / 2;
+                if (_rowTops[mid + 1] <= _offset) lo = mid + 1;
+                else hi = mid;
+            }
+            return lo;
+        }
+
+        private int VerticalReserve { get { return _maxXOffset > 0 ? BarWidth + BarInset : 0; } }
 
         private Rectangle ThumbRect()
         {
             if (_maxOffset <= 0) return Rectangle.Empty;
 
-            var trackHeight = ClientSize.Height - BarInset * 2;
+            var trackHeight = ClientSize.Height - VerticalReserve - BarInset * 2;
             if (trackHeight <= MinThumb) return Rectangle.Empty;
 
-            var content = ClientSize.Height + _maxOffset;
-            var thumb = (int)Math.Round(trackHeight * (ClientSize.Height / (double)content));
+            var content = ClientSize.Height - VerticalReserve + _maxOffset;
+            var thumb = (int)Math.Round(trackHeight * ((ClientSize.Height - VerticalReserve) / (double)content));
             if (thumb < MinThumb) thumb = MinThumb;
             if (thumb > trackHeight) thumb = trackHeight;
 
@@ -988,20 +1103,44 @@ namespace TrpgMaps
             return new Rectangle(ClientSize.Width - BarInset - BarWidth, y, BarWidth, thumb);
         }
 
+        private Rectangle HThumbRect()
+        {
+            if (_maxXOffset <= 0) return Rectangle.Empty;
+
+            var rightReserve = _maxOffset > 0 ? BarWidth + BarInset : 0;
+            var trackWidth = ClientSize.Width - rightReserve - BarInset * 2;
+            if (trackWidth <= MinThumb) return Rectangle.Empty;
+
+            var content = ClientSize.Width - rightReserve + _maxXOffset;
+            var thumb = (int)Math.Round(trackWidth * ((ClientSize.Width - rightReserve) / (double)content));
+            if (thumb < MinThumb) thumb = MinThumb;
+            if (thumb > trackWidth) thumb = trackWidth;
+
+            var travel = trackWidth - thumb;
+            var x = BarInset + (int)Math.Round(travel * (_xOffset / (double)_maxXOffset));
+
+            return new Rectangle(x, ClientSize.Height - BarInset - BarWidth, thumb, BarWidth);
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
             e.Graphics.Clear(BackColor);
             if (_items.Count == 0) return;
+            if (_rowTops.Length != _items.Count + 1) RebuildRows();
 
             var reserve = _maxOffset > 0 ? BarWidth + BarInset : 0;
-            var first = _offset / _itemHeight;
-            var last = (_offset + ClientSize.Height) / _itemHeight;
-            if (last >= _items.Count) last = _items.Count - 1;
+            var viewWidth = Math.Max(0, ClientSize.Width - reserve);
+            var viewHeight = Math.Max(0, ClientSize.Height - BottomReserve);
+            var rowWidth = _contentWidth > 0 ? Math.Max(viewWidth, _contentWidth) : viewWidth;
 
-            for (var i = first; i <= last; i++)
+            var first = FirstVisibleRow();
+            for (var i = first; i < _items.Count; i++)
             {
-                var row = new Rectangle(0, i * _itemHeight - _offset,
-                                        Math.Max(0, ClientSize.Width - reserve), _itemHeight);
+                var top = _rowTops[i];
+                if (top >= _offset + viewHeight) break;
+
+                var row = new Rectangle(-_xOffset, top - _offset, rowWidth,
+                                        _rowTops[i + 1] - top);
 
                 if (RoundedRows)
                 {
@@ -1020,12 +1159,22 @@ namespace TrpgMaps
                 ItemDraw(args);
             }
 
-            var thumb = ThumbRect();
-            if (thumb.IsEmpty) return;
-
             Ui.PrepareShape(e.Graphics);
-            Ui.FillRounded(e.Graphics, thumb, BarWidth / 2f,
-                (_thumbDrag || _thumbHover) ? Ui.ThumbActive : Ui.Thumb);
+
+            var thumb = ThumbRect();
+            if (!thumb.IsEmpty)
+            {
+                Ui.FillRounded(e.Graphics, thumb, BarWidth / 2f,
+                    (_thumbDrag || _thumbHover) ? Ui.ThumbActive : Ui.Thumb);
+            }
+
+            // 横向滚动条：和竖向同一条 4px 细线，只是转了个方向
+            var hThumb = HThumbRect();
+            if (!hThumb.IsEmpty)
+            {
+                Ui.FillRounded(e.Graphics, hThumb, BarWidth / 2f,
+                    (_hThumbDrag || _hThumbHover) ? Ui.ThumbActive : Ui.Thumb);
+            }
         }
 
         protected override void OnMouseMove(MouseEventArgs e)
@@ -1035,7 +1184,7 @@ namespace TrpgMaps
             if (_thumbDrag)
             {
                 var thumb = ThumbRect();
-                var travel = ClientSize.Height - BarInset * 2 - thumb.Height;
+                var travel = ClientSize.Height - VerticalReserve - BarInset * 2 - thumb.Height;
                 if (travel > 0)
                 {
                     var delta = e.Y - _dragOriginY;
@@ -1044,10 +1193,25 @@ namespace TrpgMaps
                 return;
             }
 
+            if (_hThumbDrag)
+            {
+                var hThumb = HThumbRect();
+                var rightReserve = _maxOffset > 0 ? BarWidth + BarInset : 0;
+                var travel = ClientSize.Width - rightReserve - BarInset * 2 - hThumb.Width;
+                if (travel > 0)
+                {
+                    var delta = e.X - _dragOriginX;
+                    SetXOffset(_dragOriginXOffset + (int)Math.Round(delta * (_maxXOffset / (double)travel)));
+                }
+                return;
+            }
+
             var overThumb = ThumbRect().Contains(e.Location);
-            if (overThumb != _thumbHover)
+            var overHThumb = HThumbRect().Contains(e.Location);
+            if (overThumb != _thumbHover || overHThumb != _hThumbHover)
             {
                 _thumbHover = overThumb;
+                _hThumbHover = overHThumb;
                 Invalidate();
             }
 
@@ -1064,6 +1228,17 @@ namespace TrpgMaps
             base.OnMouseDown(e);
             Focus();
 
+            var hThumb = HThumbRect();
+            if (!hThumb.IsEmpty && hThumb.Contains(e.Location))
+            {
+                _hThumbDrag = true;
+                _dragOriginX = e.X;
+                _dragOriginXOffset = _xOffset;
+                Capture = true;
+                Invalidate();
+                return;
+            }
+
             var thumb = ThumbRect();
             if (!thumb.IsEmpty && thumb.Contains(e.Location))
             {
@@ -1076,13 +1251,24 @@ namespace TrpgMaps
             }
 
             var index = IndexAtY(e.Y);
-            if (index >= 0) SelectedIndex = index;
+            if (index < 0) return;
+
+            var item = _items[index];
+            if (CanSelectItem != null && !CanSelectItem(item))
+            {
+                // 文件夹这类"不是素材"的项：不选中，只把点击抛出去做展开/折叠
+                if (ItemClicked != null) ItemClicked(item);
+                return;
+            }
+
+            SelectedIndex = index;
         }
 
         protected override void OnMouseUp(MouseEventArgs e)
         {
             base.OnMouseUp(e);
             _thumbDrag = false;
+            _hThumbDrag = false;
             Capture = false;
             Invalidate();
         }
@@ -1090,9 +1276,10 @@ namespace TrpgMaps
         protected override void OnMouseLeave(EventArgs e)
         {
             base.OnMouseLeave(e);
-            if (_hover == -1 && !_thumbHover) return;
+            if (_hover == -1 && !_thumbHover && !_hThumbHover) return;
             _hover = -1;
             _thumbHover = false;
+            _hThumbHover = false;
             Invalidate();
         }
 
@@ -1105,6 +1292,17 @@ namespace TrpgMaps
         protected override void OnMouseWheel(MouseEventArgs e)
         {
             base.OnMouseWheel(e);
+
+            // Shift + 滚轮 = 横向滚动（内容比列表宽时才生效）
+            var horizontal = (ModifierKeys & Keys.Shift) == Keys.Shift;
+            if (horizontal && _maxXOffset > 0)
+            {
+                SetXOffset(_xOffset - (e.Delta / 120) * 48);
+                WheelRouter.Mark();
+                var handledH = e as HandledMouseEventArgs;
+                if (handledH != null) handledH.Handled = true;
+                return;
+            }
 
             // 列表装得下就别"吃掉"滚轮 —— 让父级面板照常滚，否则光标停在
             // 一块没法滚的列表上时，面板就滚不动了。
@@ -1148,10 +1346,12 @@ namespace TrpgMaps
 
         private void EnsureVisible(int index)
         {
-            var top = index * _itemHeight;
-            var bottom = top + _itemHeight;
+            if (index < 0 || index >= _items.Count) return;
+            var top = _rowTops[index];
+            var bottom = _rowTops[index + 1];
             if (top < _offset) SetOffset(top);
-            else if (bottom > _offset + ClientSize.Height) SetOffset(bottom - ClientSize.Height);
+            else if (bottom > _offset + ClientSize.Height - BottomReserve)
+                SetOffset(bottom - (ClientSize.Height - BottomReserve));
         }
     }
 
@@ -1406,6 +1606,80 @@ namespace TrpgMaps
                 (int)Math.Round(color.R * k),
                 (int)Math.Round(color.G * k),
                 (int)Math.Round(color.B * k));
+        }
+    }
+
+    /// <summary>
+    /// 歌词视图：**不滚动**，只显示"上一句 / 当前句 / 下一句"三行，当前句高亮。
+    ///
+    /// 为什么不做一个真的滚动列表：这个面板本身就在滚动容器里（`ScrollViewport`），
+    /// 里面再套一层滚动区，两级滚动在滚轮和触摸上会互相打架。三行式是音乐播放器的
+    /// 常规做法，一眼就能看出唱到哪了，而且**每 250ms 刷一次也不心疼**。
+    /// </summary>
+    internal sealed class LyricView : Control
+    {
+        /// <summary>当前歌词（null = 这首歌没有 .lrc）。</summary>
+        public Lrc Lyrics;
+
+        /// <summary>唱到第几句（-1 = 还没到第一句）。</summary>
+        public int Index = -1;
+
+        /// <summary>
+        /// 没有歌词时显示的那句话。默认取词表；切换语言后由 MainForm 重新赋值
+        /// （这里只写一个兜底，别把中文写死成唯一出路）。
+        /// </summary>
+        public string EmptyText = Loc.T("audio.lyrics.empty");
+
+        public LyricView()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint |
+                     ControlStyles.UserPaint |
+                     ControlStyles.OptimizedDoubleBuffer |
+                     ControlStyles.ResizeRedraw, true);
+            BackColor = Theme.Panel;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.Clear(BackColor);
+
+            var lines = Lyrics == null ? null : Lyrics.Lines;
+            if (lines == null || lines.Count == 0)
+            {
+                using (var brush = new SolidBrush(Theme.TextDim))
+                using (var format = new StringFormat())
+                {
+                    format.Alignment = StringAlignment.Center;
+                    format.LineAlignment = StringAlignment.Center;
+                    g.DrawString(EmptyText, Ui.Font(8.5f), brush,
+                                 new RectangleF(0, 0, Width, Height), format);
+                }
+                return;
+            }
+
+            var rowHeight = Math.Max(18, Height / 3);
+            var middle = (Height - rowHeight) / 2;
+
+            DrawLine(g, lines, Index - 1, 0, rowHeight, Theme.TextDim, 8.5f);
+            DrawLine(g, lines, Index, middle, rowHeight, Theme.Link, 10.5f);
+            DrawLine(g, lines, Index + 1, middle + rowHeight, rowHeight, Theme.TextDim, 8.5f);
+        }
+
+        private void DrawLine(Graphics g, List<LrcLine> lines, int index, int top, int height,
+                              Color color, float size)
+        {
+            if (index < 0 || index >= lines.Count) return;
+
+            using (var brush = new SolidBrush(color))
+            using (var format = new StringFormat())
+            {
+                format.Alignment = StringAlignment.Center;
+                format.LineAlignment = StringAlignment.Center;
+                format.Trimming = StringTrimming.EllipsisCharacter;
+                g.DrawString(lines[index].Text, Ui.Font(size), brush,
+                             new RectangleF(0, top, Width, height), format);
+            }
         }
     }
 }

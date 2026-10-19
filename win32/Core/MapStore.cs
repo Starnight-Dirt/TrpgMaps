@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Security.Cryptography;
@@ -11,6 +11,12 @@ namespace TrpgMaps
     {
         public bool Success;
         public string Message;
+        /// <summary>
+        /// 机器可读的失败原因：empty / format / exists / duplicate / io。
+        /// HTTP 层靠它判断 409 还是 400 —— **别去比 Message 的文字**，
+        /// 那段文字现在是跟着界面语言变的。
+        /// </summary>
+        public string Code;
         public MapInfo Data;
     }
 
@@ -211,14 +217,14 @@ namespace TrpgMaps
         public UploadResult Upload(string fileName, byte[] content)
         {
             if (string.IsNullOrEmpty(fileName))
-                return Fail("文件名为空");
+                return Fail("empty", Loc.T("core.upload.noname"));
             if (!AppEnv.IsAllowedImage(fileName))
-                return Fail("不支持的格式");
+                return Fail("format", Loc.T("core.upload.badformat"));
 
             var safe = Path.GetFileName(fileName);
             var savePath = Path.Combine(AppEnv.MapsFolder, safe);
             if (File.Exists(savePath))
-                return Fail("文件名已存在");
+                return Fail("exists", Loc.T("core.upload.exists"));
 
             var tempPath = savePath + ".tmp";
             try
@@ -234,14 +240,14 @@ namespace TrpgMaps
                     if (GetMd5(existing) == md5)
                     {
                         File.Delete(tempPath);
-                        return Fail("图片内容重复（MD5相同）");
+                        return Fail("duplicate", Loc.T("core.upload.dup"));
                     }
                 }
 
                 if (File.Exists(savePath)) File.Delete(savePath);
                 File.Move(tempPath, savePath);
 
-                var result = new UploadResult { Success = true, Message = "上传成功" };
+                var result = new UploadResult { Success = true, Message = Loc.T("core.upload.ok"), Code = "ok" };
                 result.Data = new MapInfo(safe, savePath, md5, BuildUrl(safe));
                 return result;
             }
@@ -249,13 +255,13 @@ namespace TrpgMaps
             {
                 AppLog.Write("上传底图失败：" + safe, ex);
                 TryDelete(tempPath);
-                return Fail("上传失败：" + ex.Message);
+                return Fail("io", Loc.T("core.upload.fail", ex.Message));
             }
         }
 
-        private static UploadResult Fail(string message)
+        private static UploadResult Fail(string code, string message)
         {
-            return new UploadResult { Success = false, Message = message, Data = null };
+            return new UploadResult { Success = false, Message = message, Code = code, Data = null };
         }
 
         /// <summary>计算文件 MD5（十六进制小写）。</summary>

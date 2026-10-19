@@ -78,7 +78,15 @@ function makeEl(id) {
         width: 1, height: 1, naturalWidth: 0, naturalHeight: 0,
         addEventListener: function () {}, removeEventListener: function () {},
         appendChild: function () {}, removeAttribute: function () {}, setAttribute: function () {},
-        getContext: function () { return CTX; }, className: '', src: '' };
+        getContext: function () { return CTX; }, className: '', src: '',
+        getBoundingClientRect: function () {
+            return { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 };
+        },
+        // 悬浮菜单/语言列表要用到（r28 起）：类名切换、查子元素、innerHTML 清空
+        classList: { add: function () {}, remove: function () {}, toggle: function () {},
+                     contains: function () { return false; } },
+        querySelectorAll: function () { return []; },
+        innerHTML: '' };
     // 用 style.width/height 反推布局尺寸：等价于"元素尺寸就是 JS 写进去的那个"
     Object.defineProperty(el, 'offsetWidth', { get: function () { return parseInt(el.style.width, 10) || 0; } });
     Object.defineProperty(el, 'offsetHeight', { get: function () { return parseInt(el.style.height, 10) || 0; } });
@@ -91,8 +99,11 @@ const els = {};
 const documentStub = {
     getElementById: function (id) { return els[id] || (els[id] = makeEl(id)); },
     createElement: function (tag) { return makeEl('created:' + tag); },
+    querySelectorAll: function () { return []; },
     addEventListener: function () {},
     cookie: '',
+    title: '',
+    documentElement: makeEl('html'),
     body: makeEl('body'),
     visibilityState: 'visible',
 };
@@ -115,6 +126,14 @@ const win = {
 
 globalThis.window = win;
 globalThis.document = documentStub;
+// Node 22 自带只读的 globalThis.navigator，直接赋值会抛 TypeError
+Object.defineProperty(globalThis, 'navigator', {
+    value: { language: 'zh-CN' }, configurable: true, writable: true,
+});
+Object.defineProperty(globalThis, 'localStorage', {
+    value: { getItem: function () { return null; }, setItem: function () {} },
+    configurable: true, writable: true,
+});
 globalThis.location = win.location;
 globalThis.screen = win.screen;
 globalThis.Image = function () { return makeEl('img'); };

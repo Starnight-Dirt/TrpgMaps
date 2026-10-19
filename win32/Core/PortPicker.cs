@@ -87,13 +87,12 @@ namespace TrpgMaps
             // 10013 = WSAEACCES（系统保留 / 权限），10048 = WSAEADDRINUSE（已被占用）
             if (socket.ErrorCode == 10013)
             {
-                hint = "该端口被 Windows 保留（Hyper-V / WSL / Docker 预留的端口段），" +
-                       "没有占用者可以关闭，必须换一个端口";
+                hint = Loc.T("core.port.reserved");
                 return true;
             }
             if (socket.ErrorCode == 10048)
             {
-                hint = "该端口已被其它程序占用";
+                hint = Loc.T("core.port.used");
                 return true;
             }
             return false;

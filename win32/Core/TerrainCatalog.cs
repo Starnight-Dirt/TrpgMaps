@@ -37,9 +37,9 @@ namespace TrpgMaps
         public static string Label(string kind)
         {
             var normalized = Normalize(kind);
-            if (normalized == Entity) return "实体";
-            if (normalized == Item) return "物品";
-            return "地形";
+            if (normalized == Entity) return Loc.T("draw.entity");
+            if (normalized == Item) return Loc.T("draw.item");
+            return Loc.T("draw.terrain");
         }
 
         /// <summary>图层序号：数字越大越靠上。地形在人物/物品之下，人物与物品同级。</summary>
@@ -57,6 +57,14 @@ namespace TrpgMaps
         public string Name = string.Empty;
         /// <summary>文件名（含扩展名），也是画在格子上的唯一标识。</summary>
         public string File = string.Empty;
+        /// <summary>
+        /// 相对分类目录的路径（用 <c>/</c> 分隔），例如 <c>character/战士.png</c>。
+        /// 根目录下的素材就等于 <see cref="File"/>。
+        /// 绘图数据里存的就是它 —— 所以子目录里的素材也能被记住、能被手机端请求到。
+        /// </summary>
+        public string Relative = string.Empty;
+        /// <summary>所在子目录（相对分类目录，用 <c>/</c> 分隔）；根目录为空串。</summary>
+        public string Folder = string.Empty;
         public string Path = string.Empty;
         public string Url = string.Empty;
 
@@ -82,17 +90,55 @@ namespace TrpgMaps
         public string TraitText()
         {
             var parts = new List<string>();
-            if (Disadvantageous) parts.Add("困难地形");
-            if (Cover) parts.Add("遮蔽");
-            if (Obstacle) parts.Add("障碍");
-            if (Climb) parts.Add("可攀爬");
-            if (!string.IsNullOrEmpty(Damage)) parts.Add("伤害 " + Damage);
-            return parts.Count == 0 ? "无特殊效果" : string.Join("·", parts.ToArray());
+            if (Disadvantageous) parts.Add(Loc.T("draw.trait.hard"));
+            if (Cover) parts.Add(Loc.T("draw.trait.cover"));
+            if (Obstacle) parts.Add(Loc.T("draw.trait.obstacle"));
+            if (Climb) parts.Add(Loc.T("draw.trait.climb"));
+            if (!string.IsNullOrEmpty(Damage)) parts.Add(Loc.T("draw.trait.damage", Damage));
+            return parts.Count == 0 ? Loc.T("draw.trait.none") : string.Join("·", parts.ToArray());
         }
 
         public override string ToString()
         {
             return Name;
+        }
+    }
+
+    /// <summary>
+    /// 素材目录树里的一个文件夹。
+    ///
+    /// 只有 entity\ 与 item\ 会扫描子目录（地形仍按扁平处理）；文件夹可以多层嵌套。
+    /// <see cref="DisplayName"/> 来自文件夹里的 <c>locales.toml</c>，读不到就用
+    /// <see cref="Name"/>（文件夹本名）。
+    /// </summary>
+    internal sealed class AssetFolder
+    {
+        /// <summary>文件夹本名（磁盘上的名字）。</summary>
+        public string Name = string.Empty;
+        /// <summary>按当前界面语言显示的文件夹名。</summary>
+        public string DisplayName = string.Empty;
+        /// <summary>相对分类目录的路径（用 <c>/</c> 分隔）；根节点为空串。</summary>
+        public string Relative = string.Empty;
+        /// <summary>嵌套深度：根下的文件夹 = 0。</summary>
+        public int Depth;
+
+        public readonly List<AssetFolder> Folders = new List<AssetFolder>();
+        public readonly List<TerrainAsset> Assets = new List<TerrainAsset>();
+
+        /// <summary>这个文件夹下（含所有子文件夹）的图片总数。</summary>
+        public int TotalCount
+        {
+            get
+            {
+                var total = Assets.Count;
+                foreach (var folder in Folders) total += folder.TotalCount;
+                return total;
+            }
+        }
+
+        public override string ToString()
+        {
+            return DisplayName;
         }
     }
 
@@ -112,8 +158,12 @@ namespace TrpgMaps
     /// </summary>
     internal sealed class TerrainCatalog
     {
+        /// <summary>文件夹最多嵌套这么多层（防止有人把整个盘符软链进来）。</summary>
+        private const int MaxFolderDepth = 8;
+
         private readonly object _gate = new object();
         private Dictionary<string, List<TerrainAsset>> _byKind = new Dictionary<string, List<TerrainAsset>>();
+        private Dictionary<string, AssetFolder> _trees = new Dictionary<string, AssetFolder>();
         private Dictionary<string, TerrainAsset> _index = new Dictionary<string, TerrainAsset>(StringComparer.Ordinal);
 
         public TerrainCatalog()
@@ -151,6 +201,21 @@ namespace TrpgMaps
             }
         }
 
+        /// <summary>
+        /// 某个分类的目录树（实体 / 物品有子文件夹；地形是空的根节点 + 扁平列表）。
+        /// 返回内部快照，调用方不要改。
+        /// </summary>
+        public AssetFolder TreeOf(string kind)
+        {
+            var normalized = DrawKind.Normalize(kind);
+            lock (_gate)
+            {
+                AssetFolder root;
+                if (_trees.TryGetValue(normalized, out root)) return root;
+                return new AssetFolder();
+            }
+        }
+
         /// <summary>三个分类合起来的总数，状态行上显示用。</summary>
         public int Count
         {
@@ -165,15 +230,22 @@ namespace TrpgMaps
             }
         }
 
-        /// <summary>按「分类 + 文件名」找素材；找不到返回 null。</summary>
+        /// <summary>按「分类 + 相对路径」找素材；找不到返回 null。</summary>
         public TerrainAsset Find(string kind, string file)
         {
             if (string.IsNullOrEmpty(file)) return null;
             var normalized = DrawKind.Normalize(kind);
+            var relative = file.Replace('\\', '/').TrimStart('/');
             lock (_gate)
             {
                 TerrainAsset asset;
-                if (_index.TryGetValue(normalized + "/" + file, out asset)) return asset;
+                if (_index.TryGetValue(normalized + "/" + relative, out asset)) return asset;
+
+                // 兼容只给了文件名的旧数据：在同类里按 File 找第一个
+                foreach (var candidate in Of(normalized))
+                {
+                    if (string.Equals(candidate.File, relative, StringComparison.Ordinal)) return candidate;
+                }
                 return null;
             }
         }
@@ -200,11 +272,15 @@ namespace TrpgMaps
         {
             var byKind = new Dictionary<string, List<TerrainAsset>>();
             var index = new Dictionary<string, TerrainAsset>(StringComparer.Ordinal);
+            var trees = new Dictionary<string, AssetFolder>();
 
             foreach (var kind in DrawKind.All)
             {
                 var folder = FolderFor(kind);
                 var list = new List<TerrainAsset>();
+                var root = new AssetFolder();
+                root.Relative = string.Empty;
+                root.Depth = -1;
 
                 try
                 {
@@ -221,23 +297,12 @@ namespace TrpgMaps
                 {
                     if (Directory.Exists(folder))
                     {
-                        var files = Directory.GetFiles(folder);
-                        Array.Sort(files, StringComparer.Ordinal);
-                        foreach (var file in files)
-                        {
-                            var name = Path.GetFileName(file);
-                            if (!IsAllowedAsset(name)) continue;
-                            if (name.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase)) continue;
-
-                            var asset = new TerrainAsset();
-                            asset.Kind = kind;
-                            asset.File = name;
-                            asset.Name = Path.GetFileNameWithoutExtension(name);
-                            asset.Path = file;
-                            asset.Url = BuildUrl(kind, name);
-                            list.Add(asset);
-                            byFile[name] = asset;
-                        }
+                        // 地形保持扁平（历史行为，terrain_properties.json 也是扁平的）；
+                        // 实体与物品支持子目录 —— 角色图本来就是按职业分文件夹的。
+                        if (DrawKind.Normalize(kind) == DrawKind.Terrain)
+                            ScanFlat(kind, folder, root, list, byFile);
+                        else
+                            ScanTree(kind, folder, string.Empty, 0, root, list, byFile);
                     }
                 }
                 catch (Exception ex)
@@ -250,18 +315,142 @@ namespace TrpgMaps
 
                 list.Sort(delegate (TerrainAsset a, TerrainAsset b)
                 {
+                    var byFolder = string.Compare(a.Folder, b.Folder, StringComparison.CurrentCultureIgnoreCase);
+                    if (byFolder != 0) return byFolder;
                     return string.Compare(a.Name, b.Name, StringComparison.CurrentCultureIgnoreCase);
                 });
 
+                SortTree(root);
+
                 byKind[kind] = list;
-                foreach (var asset in list) index[kind + "/" + asset.File] = asset;
+                trees[kind] = root;
+                foreach (var asset in list) index[kind + "/" + asset.Relative] = asset;
             }
 
             lock (_gate)
             {
                 _byKind = byKind;
+                _trees = trees;
                 _index = index;
             }
+        }
+
+        /// <summary>扁平扫描（地形用）：只看分类根目录。</summary>
+        private static void ScanFlat(string kind, string folder, AssetFolder root,
+            List<TerrainAsset> list, Dictionary<string, TerrainAsset> byFile)
+        {
+            var files = Directory.GetFiles(folder);
+            Array.Sort(files, StringComparer.Ordinal);
+            foreach (var file in files)
+            {
+                var name = Path.GetFileName(file);
+                if (!IsAllowedAsset(name)) continue;
+                if (name.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase)) continue;
+
+                var asset = new TerrainAsset();
+                asset.Kind = kind;
+                asset.File = name;
+                asset.Relative = name;
+                asset.Name = Path.GetFileNameWithoutExtension(name);
+                asset.Path = file;
+                asset.Url = BuildUrl(kind, name);
+                root.Assets.Add(asset);
+                list.Add(asset);
+                byFile[name] = asset;
+            }
+        }
+
+        /// <summary>递归扫描（实体 / 物品用）：文件夹变成树节点，图片挂到所属节点。</summary>
+        private static void ScanTree(string kind, string abs, string rel, int depth,
+            AssetFolder node, List<TerrainAsset> flat, Dictionary<string, TerrainAsset> byFile)
+        {
+            if (depth > MaxFolderDepth)
+            {
+                AppLog.Write("素材目录嵌套超过 " + MaxFolderDepth + " 层，已跳过：" + abs);
+                return;
+            }
+
+            // 1) 子文件夹（先建节点，再递归）
+            string[] dirs;
+            try
+            {
+                dirs = Directory.GetDirectories(abs);
+            }
+            catch (Exception ex)
+            {
+                AppLog.Write("读取子目录失败：" + abs, ex);
+                dirs = new string[0];
+            }
+            Array.Sort(dirs, StringComparer.Ordinal);
+
+            foreach (var dir in dirs)
+            {
+                var info = new DirectoryInfo(dir);
+                if ((info.Attributes & FileAttributes.Hidden) != 0) continue;
+                if (info.Name.StartsWith(".")) continue;
+
+                var childRel = rel.Length == 0 ? info.Name : rel + "/" + info.Name;
+
+                // 每个文件夹都默认给一份 locales.toml（已存在就不动）
+                FolderLocale.Ensure(dir);
+
+                var child = new AssetFolder();
+                child.Name = info.Name;
+                child.DisplayName = FolderLocale.DisplayName(dir, info.Name);
+                child.Relative = childRel;
+                child.Depth = depth;
+                node.Folders.Add(child);
+
+                ScanTree(kind, dir, childRel, depth + 1, child, flat, byFile);
+            }
+
+            // 2) 本层的图片
+            string[] files;
+            try
+            {
+                files = Directory.GetFiles(abs);
+            }
+            catch (Exception ex)
+            {
+                AppLog.Write("读取素材文件失败：" + abs, ex);
+                files = new string[0];
+            }
+            Array.Sort(files, StringComparer.Ordinal);
+
+            foreach (var file in files)
+            {
+                var name = Path.GetFileName(file);
+                if (!IsAllowedAsset(name)) continue;
+                if (name.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase)) continue;
+
+                var asset = new TerrainAsset();
+                asset.Kind = kind;
+                asset.File = name;
+                asset.Folder = rel;
+                asset.Relative = rel.Length == 0 ? name : rel + "/" + name;
+                asset.Name = Path.GetFileNameWithoutExtension(name);
+                asset.Path = file;
+                asset.Url = BuildUrl(kind, asset.Relative);
+
+                node.Assets.Add(asset);
+                flat.Add(asset);
+                byFile[asset.Relative] = asset;
+                // 兼容旧属性文件：里面可能只写裸文件名
+                if (!byFile.ContainsKey(name)) byFile[name] = asset;
+            }
+        }
+
+        private static void SortTree(AssetFolder node)
+        {
+            node.Folders.Sort(delegate (AssetFolder a, AssetFolder b)
+            {
+                return string.Compare(a.DisplayName, b.DisplayName, StringComparison.CurrentCultureIgnoreCase);
+            });
+            node.Assets.Sort(delegate (TerrainAsset a, TerrainAsset b)
+            {
+                return string.Compare(a.Name, b.Name, StringComparison.CurrentCultureIgnoreCase);
+            });
+            foreach (var folder in node.Folders) SortTree(folder);
         }
 
         private static void ApplyProperties(string kind, Dictionary<string, TerrainAsset> byFile)
@@ -340,14 +529,47 @@ namespace TrpgMaps
                    "/" + Uri.EscapeDataString(file);
         }
 
-        /// <summary>按「分类/文件名」解析出磁盘路径（防目录穿越）。</summary>
+        /// <summary>
+        /// 按「分类/相对路径」解析出磁盘路径（防目录穿越）。
+        /// 支持子目录：<c>entity/character/战士.png</c>。
+        /// </summary>
         public static string ResolvePath(string kind, string file)
         {
             if (!DrawKind.IsValid(kind)) return null;
-            var safe = Path.GetFileName(file);
-            if (!IsAllowedAsset(safe)) return null;
-            var full = Path.Combine(FolderFor(kind), safe);
-            return File.Exists(full) ? full : null;
+            if (string.IsNullOrEmpty(file)) return null;
+
+            var relative = file.Replace('\\', '/').TrimStart('/');
+            if (relative.Length == 0) return null;
+
+            var parts = relative.Split('/');
+            var safe = new List<string>();
+            foreach (var part in parts)
+            {
+                if (part.Length == 0 || part == ".") continue;
+                if (part == "..") return null;                       // 目录穿越
+                if (part.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0) return null;
+                safe.Add(part);
+            }
+            if (safe.Count == 0) return null;
+            if (!IsAllowedAsset(safe[safe.Count - 1])) return null;
+
+            var combined = FolderFor(kind);
+            foreach (var part in safe) combined = Path.Combine(combined, part);
+
+            try
+            {
+                var root = Path.GetFullPath(FolderFor(kind));
+                if (!root.EndsWith(Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal))
+                    root += Path.DirectorySeparatorChar;
+
+                var full = Path.GetFullPath(combined);
+                if (!full.StartsWith(root, StringComparison.OrdinalIgnoreCase)) return null;
+                return File.Exists(full) ? full : null;
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         /// <summary>全部素材列表（json 用），带三个分类。</summary>
@@ -376,7 +598,8 @@ namespace TrpgMaps
                     sb.Append(MiniJson.WriteObject(
                         "kind", asset.Kind,
                         "name", asset.Name,
-                        "file", asset.File,
+                        "file", asset.Relative,
+                        "folder", asset.Folder,
                         "url", asset.Url,
                         "disadvantageous", asset.Disadvantageous,
                         "cover", asset.Cover,

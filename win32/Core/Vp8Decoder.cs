@@ -313,6 +313,8 @@ namespace TrpgMaps
             var pos = 12;
             var sawAlpha = false;
             var sawLossless = false;
+            Chunk vp8 = default(Chunk);
+            var haveVp8 = false;
 
             while (pos + 8 <= b.Length)
             {
@@ -326,11 +328,15 @@ namespace TrpgMaps
 
                 if (fourcc == "VP8 ")
                 {
+                    // ⚠️ **不能在这里直接 return** —— 带透明的 WebP 是
+                    // `VP8X + ALPH + VP8 ` 顺序，ALPH 在前；一遇到 VP8 就返回，
+                    // 后面那句"带透明通道就报错"永远走不到，
+                    // 结果 alpha 被静默丢掉、整张图变成不透明（边缘亮像素就成了"白色撕裂"）。
+                    // 所以这里只记下来，扫完所有块再判断。
                     if (body + size > b.Length) size = b.Length - body;
-                    var chunk = new Chunk();
-                    chunk.Offset = body;
-                    chunk.Length = size;
-                    return chunk;
+                    vp8.Offset = body;
+                    vp8.Length = size;
+                    haveVp8 = true;
                 }
                 if (fourcc == "VP8L") sawLossless = true;
                 if (fourcc == "ALPH") sawAlpha = true;
@@ -338,12 +344,17 @@ namespace TrpgMaps
                 pos = body + size + (size & 1);   // RIFF 块按偶数字节对齐
             }
 
+            if (sawAlpha)
+                throw new NotSupportedException(
+                    "这张 WebP 带透明通道（VP8X + ALPH），内置解码器只支持不带透明通道的有损 WebP。" +
+                    "请导出成 PNG，或导出不带 alpha 的 WebP。");
+
+            if (haveVp8) return vp8;
+
             if (sawLossless)
                 throw new NotSupportedException(
                     "这是无损 WebP（VP8L），内置解码器只支持有损 WebP。" +
                     "请用「有损」模式重新导出（例如 cwebp -q 90，或转换工具里不要勾选无损）。");
-            if (sawAlpha)
-                throw new NotSupportedException("这是带透明通道的 WebP（VP8X + ALPH），内置解码器只支持不带透明通道的有损 WebP。");
             throw new InvalidOperationException("WebP 里没有找到 VP8 图像数据");
         }
 

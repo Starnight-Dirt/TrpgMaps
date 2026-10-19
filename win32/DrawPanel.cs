@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -39,10 +39,28 @@ namespace TrpgMaps
         private ModernButton _kindTerrain, _kindEntity, _kindItem;
         private ModernList _assetList;
         private Label _assetHint;
+        private ModernButton _rescanButton;
         private Label _statusLabel;
         private readonly Dictionary<string, string> _selectedFile = new Dictionary<string, string>(StringComparer.Ordinal);
         private readonly Dictionary<string, Image> _thumbs = new Dictionary<string, Image>(StringComparer.Ordinal);
         private string _kind = DrawKind.Terrain;
+
+        /// <summary>
+        /// 展开着的文件夹（相对路径，忽略大小写）。折叠状态只活在本次运行里 ——
+        /// 素材树千变万化，持久化反而会让"刚加的文件夹藏着看不见"。
+        /// </summary>
+        private readonly HashSet<string> _expandedFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>当前列表里的一行：要么是文件夹，要么是一张图片。</summary>
+        private sealed class AssetRow
+        {
+            public AssetFolder Folder;
+            public TerrainAsset Asset;
+            public int Depth;
+            public bool IsFolder { get { return Folder != null; } }
+        }
+
+        private readonly List<AssetRow> _rows = new List<AssetRow>();
 
         // ---- 画笔 ----
         private ModernButton _modeManual, _modeBrush;
@@ -138,13 +156,38 @@ namespace TrpgMaps
             get { return _kind; }
         }
 
+        /// <summary>
+        /// 换界面语言后重建整块面板。
+        ///
+        /// 别的主面板是"关掉就丢"，重新打开时自然用的是新词；这个面板是**常驻控件**
+        /// （`_drawPanel` 只建一次），不重建的话切到英文后它还是满屏中文。
+        /// 分类 / 选中素材 / 笔刷状态这些字段都保留，只有控件重来一遍。
+        /// </summary>
+        public void ReloadLanguage()
+        {
+            var old = _scroll;
+            Controls.Clear();          // 只摘不销毁
+            if (old != null) old.Dispose();
+            _shapeButtons.Clear();
+
+            BuildContent();            // 重新取词、重新挂事件、重新扫素材树
+            UpdateBrushPreview();      // 画布上那圈蓝选区也要跟着画回来
+            AppLog.Write("绘图面板：已按当前语言重建");
+        }
+
+        /// <summary>自检用：当前选中的素材（没有则 null）。</summary>
+        public TerrainAsset SelectedAsset
+        {
+            get { return CurrentAsset(); }
+        }
+
         /// <summary>一行状态文本，写进 --ui / 日志用。</summary>
         public string StateText()
         {
             var asset = CurrentAsset();
             return "分类=" + DrawKind.Label(_kind) +
                    " 素材=" + (asset == null ? "(未选)" : asset.Name) +
-                   " 本素材格数=" + (asset == null ? 0 : _drawings.CountAsset(_kind, asset.File)) +
+                   " 本素材格数=" + (asset == null ? 0 : _drawings.CountAsset(_kind, asset.Relative)) +
                    " 模式=" + DrawGeometry.ModeLabel(_mode) +
                    " 形状=" + DrawGeometry.ShapeLabel(_shape) +
                    " 选区=" + (_loose ? "宽泛" : "严格") +
@@ -178,31 +221,50 @@ namespace TrpgMaps
             var inner = PanelWidth - PanelInset * 2;
 
             // ---- 分类 ----
-            AddRow(MakeLabel("绘制分类", 9f, Theme.Text), 20, inner);
+            AddRow(MakeLabel(Loc.T("draw.kind"), 9f, Theme.Text), 20, inner);
 
             var kindRow = MakeRow();
-            _kindTerrain = MakeToggle("地形", 84);
+            _kindTerrain = MakeToggle(Loc.T("draw.terrain"), 84);
             _kindTerrain.Click += delegate { SetKind(DrawKind.Terrain); };
             kindRow.Controls.Add(_kindTerrain);
 
-            _kindEntity = MakeToggle("实体", 84);
+            _kindEntity = MakeToggle(Loc.T("draw.entity"), 84);
             _kindEntity.Margin = new Padding(6, 3, 0, 0);
             _kindEntity.Click += delegate { SetKind(DrawKind.Entity); };
             kindRow.Controls.Add(_kindEntity);
 
-            _kindItem = MakeToggle("物品", 84);
+            _kindItem = MakeToggle(Loc.T("draw.item"), 84);
             _kindItem.Margin = new Padding(6, 3, 0, 0);
             _kindItem.Click += delegate { SetKind(DrawKind.Item); };
             kindRow.Controls.Add(_kindItem);
 
             _content.Controls.Add(kindRow);
 
-            // ---- 素材列表 ----
+            // ---- 素材树 ----
+            //
+            // 实体 / 物品目录里允许放子文件夹（角色按职业分、物品按类型分）。
+            // 列表把树**打平**成一维行：文件夹行 30px（三角号 + 名字），图片行 50px（缩略图）。
+            // 内容比列表宽时底部出现横向滚动条（与竖向同一条 4px 细线）。
             _assetList = new ModernList();
             _assetList.BackColor = Theme.Track;
             _assetList.ItemHeight = 50;
             _assetList.RoundedRows = true;
             _assetList.ItemDraw = DrawAssetItem;
+            _assetList.RowHeight = delegate(object item)
+            {
+                var row = item as AssetRow;
+                return row != null && row.IsFolder ? 30 : 50;
+            };
+            _assetList.CanSelectItem = delegate(object item)
+            {
+                var row = item as AssetRow;
+                return row != null && !row.IsFolder;
+            };
+            _assetList.ItemClicked += delegate(object item)
+            {
+                var row = item as AssetRow;
+                if (row != null && row.IsFolder) ToggleFolder(row.Folder);
+            };
             _assetList.ItemActivated += delegate { CommitAssetSelection(); };
             _assetList.SelectedIndexChanged += delegate { CommitAssetSelection(); };
             AddRow(_assetList, 208, inner);
@@ -210,17 +272,21 @@ namespace TrpgMaps
             _assetHint = MakeLabel("", 8.5f, Theme.TextDim);
             AddRow(_assetHint, 34, inner);
 
+            _rescanButton = MakeToggle(Loc.T("draw.rescan"), 84);
+            _rescanButton.Click += delegate { RefreshAssets(); };
+            AddRow(_rescanButton, 28, 84);
+
             AddSeparator(inner);
 
             // ---- 画笔模式 ----
-            AddRow(MakeLabel("画笔模式", 9f, Theme.Text), 20, inner);
+            AddRow(MakeLabel(Loc.T("draw.brushmode"), 9f, Theme.Text), 20, inner);
 
             var modeRow = MakeRow();
-            _modeManual = MakeToggle("手动", 128);
+            _modeManual = MakeToggle(Loc.T("draw.manual"), 128);
             _modeManual.Click += delegate { SetMode(BrushMode.Manual); };
             modeRow.Controls.Add(_modeManual);
 
-            _modeBrush = MakeToggle("笔刷", 128);
+            _modeBrush = MakeToggle(Loc.T("draw.brush"), 128);
             _modeBrush.Margin = new Padding(6, 3, 0, 0);
             _modeBrush.Click += delegate { SetMode(BrushMode.Brush); };
             modeRow.Controls.Add(_modeBrush);
@@ -232,14 +298,14 @@ namespace TrpgMaps
             // 刻意摆在「笔刷形状」**上面**：面板高度封顶 560px，内容一直是需要滚的，
             // 而这个开关是常用的（要在地图上边看边切），摆太靠下就得先滚一屏才够得着。
             // 放在这里，打开面板不用滚就能看见。
-            AddRow(MakeLabel("选区方式（笔刷模式）", 8.5f, Theme.TextDim), 18, inner);
+            AddRow(MakeLabel(Loc.T("draw.selection"), 8.5f, Theme.TextDim), 18, inner);
 
             var selectRow = MakeRow();
-            _strictButton = MakeToggle("严格", 128);
+            _strictButton = MakeToggle(Loc.T("draw.strict"), 128);
             _strictButton.Click += delegate { SetSelectionMode(false); };
             selectRow.Controls.Add(_strictButton);
 
-            _looseButton = MakeToggle("宽泛", 128);
+            _looseButton = MakeToggle(Loc.T("draw.loose"), 128);
             _looseButton.Margin = new Padding(6, 3, 0, 0);
             _looseButton.Click += delegate { SetSelectionMode(true); };
             selectRow.Controls.Add(_looseButton);
@@ -247,28 +313,28 @@ namespace TrpgMaps
             _content.Controls.Add(selectRow);
 
             _selectHint = MakeLabel("", 8.5f, Theme.TextDim);
-            AddRow(_selectHint, 20, inner);
+            AddRow(_selectHint, 30, inner);   // 英文两行
 
             AddSeparator(inner);
 
             // ---- 笔刷形状 ----
-            var shapeLabel = MakeLabel("笔刷形状（笔刷模式）", 8.5f, Theme.TextDim);
+            var shapeLabel = MakeLabel(Loc.T("draw.shape"), 8.5f, Theme.TextDim);
             AddRow(shapeLabel, 18, inner);
 
             var shapeRow1 = MakeRow();
-            AddShapeButton(shapeRow1, BrushShape.Line, "线形", 128, false);
-            AddShapeButton(shapeRow1, BrushShape.Cone, "锥形/扇形", 128, true);
+            AddShapeButton(shapeRow1, BrushShape.Line, Loc.T("draw.line"), 128, false);
+            AddShapeButton(shapeRow1, BrushShape.Cone, Loc.T("draw.cone"), 128, true);
             _content.Controls.Add(shapeRow1);
 
             var shapeRow2 = MakeRow();
-            AddShapeButton(shapeRow2, BrushShape.Cube, "立方", 128, false);
-            AddShapeButton(shapeRow2, BrushShape.Sphere, "球形/圆形", 128, true);
+            AddShapeButton(shapeRow2, BrushShape.Cube, Loc.T("draw.cube"), 128, false);
+            AddShapeButton(shapeRow2, BrushShape.Sphere, Loc.T("draw.sphere"), 128, true);
             _content.Controls.Add(shapeRow2);
 
             // 扇形张角只在"锥形"下出现
             _fanRow = MakeRow();
             _fanCombo = new ModernDropDown();
-            _fanCombo.SetItems(new List<string> { "张角 53°（D&D 喷吐）", "张角 60°", "张角 90°（四分之一圆）", "张角 120°" }, 2);
+            _fanCombo.SetItems(new List<string> { Loc.T("draw.fan53"), Loc.T("draw.fan60"), Loc.T("draw.fan90"), Loc.T("draw.fan120") }, 2);
             _fanCombo.SelectedIndexChanged += delegate
             {
                 _fanAngle = FanAngleFromIndex(_fanCombo.SelectedIndex);
@@ -282,13 +348,13 @@ namespace TrpgMaps
             _content.Controls.Add(_fanRow);
 
             _modeHint = MakeLabel("", 8.5f, Theme.TextDim);
-            AddRow(_modeHint, 32, inner);
+            AddRow(_modeHint, 62, inner);     // 英文四行
 
             AddSeparator(inner);
 
             // ---- 橡皮 / 清空 ----
             var eraseRow = MakeRow();
-            _eraserButton = MakeToggle("橡皮擦", 84);
+            _eraserButton = MakeToggle(Loc.T("draw.eraser"), 84);
             _eraserButton.Click += delegate
             {
                 _eraser = !_eraser;
@@ -302,12 +368,12 @@ namespace TrpgMaps
             // 以前这里是按分类清（ClearKind），而地形类里同时铺了「高草丛」「火焰」etc. 时，
             // 点一下会把整类全清 —— 和「清空全部」看起来一模一样，等于没有这个按钮。
             // （按钮文字按用户要求叫「清空本类」，行为仍然是"只摘当前这一张素材"。）
-            _clearAssetButton = MakeToggle("清空本类", 84);
+            _clearAssetButton = MakeToggle(Loc.T("draw.clearasset"), 84);
             _clearAssetButton.Margin = new Padding(6, 3, 0, 0);
             _clearAssetButton.Click += delegate { ClearCurrentAsset(); };
             eraseRow.Controls.Add(_clearAssetButton);
 
-            var clearAll = MakeToggle("清空全部", 84);
+            var clearAll = MakeToggle(Loc.T("draw.clearall"), 84);
             clearAll.Margin = new Padding(6, 3, 0, 0);
             clearAll.BackColor = Theme.Danger;
             clearAll.Click += delegate { ClearAll(); };
@@ -495,8 +561,8 @@ namespace TrpgMaps
             if (_selectHint != null)
             {
                 _selectHint.Text = _loose
-                    ? "宽泛：形状真正压到的格都算（只相切不算）"
-                    : "严格：只有格心落在形状里的格才算";
+                    ? Loc.T("draw.loose.hint")
+                    : Loc.T("draw.strict.hint");
             }
 
             if (_eraserButton != null)
@@ -513,8 +579,8 @@ namespace TrpgMaps
             if (_modeHint != null)
             {
                 _modeHint.Text = _mode == BrushMode.Manual
-                    ? "按住左键在地图上拖动，扫过的格子覆盖素材。"
-                    : "先点一下放原点，再拖出半径后点第二下成形；扇形还要转好角度点第三下。右键取消。";
+                    ? Loc.T("draw.hint.manual")
+                    : Loc.T("draw.hint.brush");
             }
 
             if (_scroll != null) _scroll.RefreshLayout();
@@ -533,46 +599,133 @@ namespace TrpgMaps
             _cache.Clear();
             DisposeThumbs();
 
-            var list = _catalog.Of(_kind);
+            // 把目录树打平成列表行（只展开 _expandedFolders 里的）
+            _rows.Clear();
+            Flatten(_catalog.TreeOf(_kind), 0);
+
             _assetList.BeginUpdate();
             _assetList.Items.Clear();
-            foreach (var asset in list) _assetList.Items.Add(asset);
-            _assetList.EndUpdate();
+            foreach (var row in _rows) _assetList.Items.Add(row);
 
-            var wanted = list.Count * _assetList.ItemHeight + 2;
-            if (wanted < 56) wanted = 56;
-            if (wanted > 208) wanted = 208;
-            _assetList.Height = wanted;
-
-            // 选中项尽量保持
+            // 选中项尽量保持（按相对路径认）
             string previous;
             if (_selectedFile.TryGetValue(_kind, out previous))
             {
-                for (var i = 0; i < list.Count; i++)
+                for (var i = 0; i < _rows.Count; i++)
                 {
-                    if (string.Equals(list[i].File, previous, StringComparison.Ordinal))
+                    if (_rows[i].Asset != null &&
+                        string.Equals(_rows[i].Asset.Relative, previous, StringComparison.Ordinal))
                     {
                         _assetList.SelectSilently(i);
                         break;
                     }
                 }
             }
+            _assetList.EndUpdate();
 
+            var wanted = 2;
+            foreach (var row in _rows) wanted += row.IsFolder ? 30 : 50;
+            if (wanted < 56) wanted = 56;
+            if (wanted > 208) wanted = 208;
+            _assetList.Height = wanted;
+
+            // 横向滚动条：内容比列表宽时才出现（长文件夹名 / 深层缩进都会超）
+            _assetList.ContentWidth = MeasureRows();
+            AppLog.Write("素材树（" + _kind + "）：" + _rows.Count + " 行，内容宽 " +
+                         _assetList.ContentWidth + "px，列表宽 " + _assetList.Width +
+                         "px，横向滚动=" + (_assetList.HorizontalScrollbarVisible ? "有" : "无"));
+
+            var total = _catalog.Of(_kind).Count;
             if (_assetHint != null)
             {
-                _assetHint.Text = list.Count == 0
-                    ? "（「" + DrawKind.Label(_kind) + "」还没有素材）\n把图片放进 exe 同级的 " + _kind + "\\ 目录，再点「重新扫描」"
-                    : _kind + "\\ 共 " + list.Count + " 项";
+                _assetHint.Text = total == 0
+                    ? Loc.T("draw.empty", DrawKind.Label(_kind), _kind)
+                    : Loc.T("draw.count", _kind, total);
             }
 
             if (_scroll != null) _scroll.RefreshLayout();
         }
 
+        /// <summary>把树按展开状态打平（文件夹在前、图片在后，和目录树一致）。</summary>
+        private void Flatten(AssetFolder folder, int depth)
+        {
+            foreach (var sub in folder.Folders)
+            {
+                var row = new AssetRow();
+                row.Folder = sub;
+                row.Depth = depth;
+                _rows.Add(row);
+
+                if (_expandedFolders.Contains(sub.Relative)) Flatten(sub, depth + 1);
+            }
+
+            foreach (var asset in folder.Assets)
+            {
+                var row = new AssetRow();
+                row.Asset = asset;
+                row.Depth = depth;
+                _rows.Add(row);
+            }
+        }
+
+        /// <summary>点文件夹行：展开 / 折叠，并保持滚动位置大致不动。</summary>
+        private void ToggleFolder(AssetFolder folder)
+        {
+            if (folder == null) return;
+
+            if (_expandedFolders.Contains(folder.Relative)) _expandedFolders.Remove(folder.Relative);
+            else _expandedFolders.Add(folder.Relative);
+
+            var keepOffset = _assetList.ScrollOffset;
+            RefreshAssets();
+            _assetList.SetOffset(keepOffset);
+            AppLog.Write("素材树：" + (folder.Relative) + (_expandedFolders.Contains(folder.Relative) ? " 展开" : " 折叠"));
+        }
+
+        /// <summary>
+        /// 估算列表内容宽度（只用于判断要不要横向滚动条）。
+        /// 用真实字体量，宁可略宽 —— 略宽只是多一条滚动条，量窄了文字会被硬切。
+        /// </summary>
+        private int MeasureRows()
+        {
+            var widest = 0;
+            foreach (var row in _rows)
+            {
+                var indent = 10 + row.Depth * 14;
+                var width = indent;
+
+                if (row.IsFolder)
+                {
+                    width += 18;   // 三角号
+                    width += TextRenderer.MeasureText(row.Folder.DisplayName,
+                        Ui.Font(9f, FontStyle.Bold)).Width;
+                    width += 10 + TextRenderer.MeasureText(
+                        Loc.T("draw.folder.count", row.Folder.TotalCount), Ui.Font(7.5f)).Width;
+                }
+                else
+                {
+                    width += 36 + 9;   // 缩略图 + 间距
+                    width += Math.Max(
+                        TextRenderer.MeasureText(row.Asset.Name, Ui.Font(9f, FontStyle.Bold)).Width,
+                        TextRenderer.MeasureText(row.Asset.TraitText(), Ui.Font(7.5f)).Width);
+                }
+
+                width += 16;
+                if (width > widest) widest = width;
+            }
+            return widest;
+        }
+
         private void CommitAssetSelection()
         {
-            var asset = _assetList.SelectedItem as TerrainAsset;
+            // ⚠️ 列表里的项是 AssetRow（文件夹行 / 图片行），**不是** TerrainAsset。
+            // 这里曾经写成 `as TerrainAsset`，改多级菜单时跟着改漏了 —— 结果永远拿到 null，
+            // `_selectedFile` 一次都没被写过 ⇒ 面板上"看起来选中了"，实际上没素材，
+            // 手动和笔刷都画不出东西（v1.0.3 的回归）。
+            var row = _assetList.SelectedItem as AssetRow;
+            var asset = row == null ? null : row.Asset;
             if (asset == null) return;
-            _selectedFile[_kind] = asset.File;
+            _selectedFile[_kind] = asset.Relative;
             _eraser = false;
             ApplyButtonStates();
             RefreshStatus();
@@ -587,33 +740,34 @@ namespace TrpgMaps
 
             if (_eraser)
             {
-                lines.Add("橡皮擦：擦掉「" + DrawKind.Label(_kind) + "」这一层");
+                lines.Add(Loc.T("draw.erasing", DrawKind.Label(_kind)));
             }
             else if (asset == null)
             {
-                lines.Add("还没选素材 —— 先在上面点一项");
+                lines.Add(Loc.T("draw.noasset"));
             }
             else
             {
-                lines.Add("当前：" + asset.Name + "（" + asset.TraitText() + "）");
+                lines.Add(Loc.T("draw.current", asset.Name, asset.TraitText()));
                 if (!string.IsNullOrEmpty(asset.Note)) lines.Add(asset.Note);
 
                 // 「清空本类」只摘这一张 —— 把"这一张到底占了多少格"摆出来，
                 // 免得点和"清空全部"之间还要靠猜。
-                var mine = _drawings.CountAsset(_kind, asset.File);
-                lines.Add("本素材已画 " + mine + " 格（「清空本类」只摘这一张）");
+                var mine = _drawings.CountAsset(_kind, asset.Relative);
+                lines.Add(Loc.T("draw.painted", mine));
             }
 
             if (_hasOrigin)
             {
-                var where = _origin.IsCellCenter ? "格心" : "网格点";
-                var text = "原点：" + where + " (" + _origin.HX + "," + _origin.HY + ")";
-                if (_radiusFixed) text += "  半径 " + DrawGeometry.DescribeDistance(_radiusHalf * DrawGeometry.FeetPerHalfCell);
-                else text += "  —— 移动鼠标量半径，再点一下";
+                var where = _origin.IsCellCenter ? Loc.T("draw.origin.center") : Loc.T("draw.origin.node");
+                var text = Loc.T("draw.origin", where, _origin.HX, _origin.HY);
+                if (_radiusFixed) text += "  " + Loc.T("draw.radius.fixed",
+                    DrawGeometry.DescribeDistance(_radiusHalf * DrawGeometry.FeetPerHalfCell));
+                else text += "  " + Loc.T("draw.radius.moving");
                 lines.Add(text);
             }
 
-            lines.Add("已画 " + _drawings.Count + " 格");
+            lines.Add(Loc.T("draw.total", _drawings.Count));
 
             _statusLabel.Text = string.Join("\n", lines.ToArray());
         }
@@ -624,7 +778,16 @@ namespace TrpgMaps
 
         private void DrawAssetItem(ListItemDrawArgs args)
         {
-            var asset = args.Item as TerrainAsset;
+            var row = args.Item as AssetRow;
+            if (row == null) return;
+
+            if (row.IsFolder)
+            {
+                DrawFolderRow(args, row);
+                return;
+            }
+
+            var asset = row.Asset;
             if (asset == null) return;
 
             var box = args.Bounds;
@@ -632,7 +795,9 @@ namespace TrpgMaps
             var background = selected ? Theme.ButtonHover : (args.Hover ? Theme.Card : Theme.Track);
             Ui.FillRounded(args.Graphics, box, 6f, background);
 
-            var slot = new Rectangle(box.X + 7, box.Y + 7, Math.Max(1, box.Height - 14), Math.Max(1, box.Height - 14));
+            var indent = row.Depth * 14;
+            var slot = new Rectangle(box.X + 7 + indent, box.Y + 7,
+                Math.Max(1, box.Height - 14), Math.Max(1, box.Height - 14));
             var thumb = GetThumb(asset);
             if (thumb != null)
             {
@@ -646,12 +811,13 @@ namespace TrpgMaps
 
             Ui.PrepareText(args.Graphics);
             var textRect = new Rectangle(slot.Right + 9, box.Y + 2,
-                Math.Max(0, box.Right - slot.Right - 18), box.Height - 4);
+                Math.Max(0, box.Width - (slot.Right - box.X) - 18), box.Height - 4);
 
             using (var format = new StringFormat())
             {
                 format.LineAlignment = StringAlignment.Center;
-                format.Trimming = StringTrimming.EllipsisCharacter;
+                // 横向滚动条已经能看全了，这里就**不要省略号** —— 否则滚到右边也只看到"…"。
+                format.Trimming = StringTrimming.None;
                 format.FormatFlags = StringFormatFlags.NoWrap;
 
                 var nameRect = new Rectangle(textRect.X, textRect.Y, textRect.Width, textRect.Height / 2 + 2);
@@ -664,6 +830,74 @@ namespace TrpgMaps
                 using (var brush = new SolidBrush(Theme.TextDim))
                 {
                     args.Graphics.DrawString(asset.TraitText(), Ui.Font(7.5f), brush, traitRect, format);
+                }
+            }
+        }
+
+        /// <summary>
+        /// 文件夹行：缩进 + 三角号（▶ 折叠 / ▼ 展开）+ 显示名 + 图片总数。
+        /// 三角号就是"缩略图的位置"—— 文件夹没有缩略图，放个可点的箭头最直观。
+        /// </summary>
+        private void DrawFolderRow(ListItemDrawArgs args, AssetRow row)
+        {
+            var box = args.Bounds;
+            var folder = row.Folder;
+            if (folder == null) return;
+
+            var background = args.Hover ? Theme.Card : Theme.Track;
+            Ui.FillRounded(args.Graphics, box, 5f, background);
+
+            var x = box.X + 10 + row.Depth * 14;
+            var cy = box.Y + box.Height / 2;
+            var expanded = _expandedFolders.Contains(folder.Relative);
+
+            Ui.PrepareShape(args.Graphics);
+            using (var path = new GraphicsPath())
+            {
+                if (expanded)
+                {
+                    path.AddLine(x, cy - 4, x + 9, cy - 4);
+                    path.AddLine(x + 9, cy - 4, x + 4.5f, cy + 3);
+                }
+                else
+                {
+                    path.AddLine(x, cy - 5, x + 8, cy);
+                    path.AddLine(x + 8, cy, x, cy + 5);
+                }
+                path.CloseFigure();
+                using (var brush = new SolidBrush(args.Hover ? Theme.Text : Theme.Link))
+                {
+                    args.Graphics.FillPath(brush, path);
+                }
+            }
+
+            Ui.PrepareText(args.Graphics);
+            using (var format = new StringFormat())
+            {
+                format.LineAlignment = StringAlignment.Center;
+                format.Trimming = StringTrimming.None;
+                format.FormatFlags = StringFormatFlags.NoWrap;
+
+                var nameRect = new Rectangle(x + 16, box.Y, Math.Max(0, box.Width - (x - box.X) - 22), box.Height);
+                using (var brush = new SolidBrush(Theme.Text))
+                {
+                    args.Graphics.DrawString(folder.DisplayName, Ui.Font(9f, FontStyle.Bold),
+                        brush, nameRect, format);
+                }
+            }
+
+            // 计数紧跟在名字后面（不是贴右边 —— 横向滚动时它也应该跟着走）
+            var width = TextRenderer.MeasureText(folder.DisplayName, Ui.Font(9f, FontStyle.Bold)).Width;
+            var countRect = new Rectangle(x + 22 + width, box.Y, Math.Max(0, box.Width - (x - box.X) - width - 28), box.Height);
+            using (var format = new StringFormat())
+            {
+                format.LineAlignment = StringAlignment.Center;
+                format.Trimming = StringTrimming.None;
+                format.FormatFlags = StringFormatFlags.NoWrap;
+                using (var brush = new SolidBrush(Theme.TextDim))
+                {
+                    args.Graphics.DrawString(Loc.T("draw.folder.count", folder.TotalCount),
+                        Ui.Font(7.5f), brush, countRect, format);
                 }
             }
         }
@@ -682,7 +916,7 @@ namespace TrpgMaps
         private Image GetThumb(TerrainAsset asset)
         {
             Image cached;
-            if (_thumbs.TryGetValue(asset.File, out cached)) return cached;
+            if (_thumbs.TryGetValue(asset.Relative, out cached)) return cached;
 
             Image thumb = null;
             try
@@ -694,7 +928,7 @@ namespace TrpgMaps
                 AppLog.Write("生成素材缩略图失败：" + asset.Path, ex);
             }
 
-            _thumbs[asset.File] = thumb;
+            _thumbs[asset.Relative] = thumb;
             return thumb;
         }
 
@@ -731,7 +965,7 @@ namespace TrpgMaps
                 return;
             }
 
-            var removed = _drawings.ClearAsset(_kind, asset.File);
+            var removed = _drawings.ClearAsset(_kind, asset.Relative);
             CancelSelection();
             RefreshStatus();
             Notify(true);
@@ -908,7 +1142,7 @@ namespace TrpgMaps
             var asset = CurrentAsset();
             var changed = _eraser
                 ? _drawings.Erase(_kind, cells)
-                : _drawings.Paint(_kind, cells, asset.File);
+                : _drawings.Paint(_kind, cells, asset.Relative);
 
             if (changed > 0)
             {
@@ -940,7 +1174,7 @@ namespace TrpgMaps
 
             var changed = _eraser
                 ? _drawings.Erase(_kind, cells)
-                : _drawings.Paint(_kind, cells, asset.File);
+                : _drawings.Paint(_kind, cells, asset.Relative);
 
             AppLog.Write("绘图笔刷：" + DrawGeometry.ShapeLabel(_shape) +
                          " 半径 " + _radiusHalf + " 半格 → " + cells.Count + " 格，改动 " + changed);
@@ -1032,13 +1266,36 @@ namespace TrpgMaps
         public void SelectFirstAssetForShot()
         {
             _shotLocked = false;          // 这一步不摆选区，把鼠标还给系统（见 _shotLocked）
-            if (_assetList != null && _assetList.Count > 0)
+
+            // 列表里第一行可能是文件夹（实体 / 物品会分目录），要找到第一张**图片**行
+            if (_assetList != null)
             {
-                _assetList.SelectedIndex = 0;
-                CommitAssetSelection();
+                for (var i = 0; i < _rows.Count; i++)
+                {
+                    if (_rows[i].Asset == null) continue;
+                    _assetList.SelectedIndex = i;
+                    CommitAssetSelection();
+                    break;
+                }
             }
             SetMode(BrushMode.Manual);
             RefreshStatus();
+        }
+
+        /// <summary>截图用：把整棵树都展开（平时用户是点一个开一个）。</summary>
+        public void ExpandAllForShot()
+        {
+            ExpandAll(_catalog.TreeOf(_kind));
+            RefreshAssets();
+        }
+
+        private void ExpandAll(AssetFolder folder)
+        {
+            foreach (var sub in folder.Folders)
+            {
+                _expandedFolders.Add(sub.Relative);
+                ExpandAll(sub);
+            }
         }
 
         /// <summary>
@@ -1183,7 +1440,7 @@ namespace TrpgMaps
             }
 
             Ui.PrepareText(g);
-            Ui.DrawText(g, "绘图", Ui.Font(11f, FontStyle.Bold), Color.White,
+            Ui.DrawText(g, Loc.T("draw.title"), Ui.Font(11f, FontStyle.Bold), Color.White,
                 new Rectangle(PanelInset, 0, 120, TitleHeight), ContentAlignment.MiddleLeft);
 
             Ui.DrawText(g, DrawKind.Label(_kind) + " · " + DrawGeometry.ModeLabel(_mode),

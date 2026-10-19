@@ -122,7 +122,7 @@ def main():
         open(os.path.join(OUT, "dom-no-passwd.html"), "w", encoding="utf-8").write(dom)
 
         check("player page loads (player.js rev printed)",
-              "player.js r27" in dom, _grab(dom, "player.js r"))
+              "player.js r28" in dom, _grab(dom, "player.js r"))
         check("room parsed from the url path", "房间 URL " + room in dom, _grab(dom, "房间 URL"))
         check("server room matches the url room", "服务器 " + room in dom, _grab(dom, "服务器"))
         check("password field is SHOWN without ?passwd=",
@@ -166,6 +166,30 @@ def main():
         check("join page knows it is /join", "/join(手填)" in dom3, _grab(dom3, "房间 URL"))
         check("join page does not auto-login", 'id="player-name-input"' in dom3)
 
+        # ---- ⑤ 界面语言：网页端的「设置 → 语言」（?lang= 只是首次默认值） ----
+        # 和电脑版同一套顺序规则；但没有确认框/回退，选了就写 localStorage。
+        check("chinese ui keeps the chinese placeholders",
+              'placeholder="输入你的玩家名称"' in dom, "")
+
+        url_en = "%s/%s/player?passwd=%s&lang=en-us" % (base, room, PASSWORD)
+        dom_en = edge(["--dump-dom", url_en])
+        open(os.path.join(OUT, "dom-english.html"), "w", encoding="utf-8").write(dom_en)
+
+        check("english ui: document lang is en-US", 'lang="en-US"' in dom_en, "")
+        check("english ui: login title", "Join the game" in dom_en, "")
+        check("english ui: name + password placeholders",
+              'placeholder="Your player name"' in dom_en and
+              'placeholder="Room password"' in dom_en, "")
+        check("english ui: enter button", ">Enter</button>" in dom_en, "")
+        check("english ui: menu items (settings / leave room / language)",
+              ">Settings</button>" in dom_en and ">Leave room</button>" in dom_en and
+              ">Language</span>" in dom_en, "")
+        check("english ui: no chinese login title left", "加入游戏" not in dom_en, "")
+        check("menu has three pages",
+              dom_en.count('data-page="') == 3, str(dom_en.count('data-page="')))
+        check("language list has both languages",
+              'data-lang="zh-cn"' in dom_en and 'data-lang="en-us"' in dom_en, "")
+
         # ---- ③ 截图（目视：登录面板 / 密码框 / 悬浮按钮的位置与样式） ----
         # 不能带 virtual-time-budget（会和 --screenshot 一起挂，见 edge() 的说明）。
         shot1 = os.path.join(OUT, "01-login-need-passwd.png")
@@ -181,6 +205,13 @@ def main():
         edge(["--window-size=430,860", "--screenshot=" + shot2, url_with_pw])
         size2 = os.path.getsize(shot2) if os.path.exists(shot2) else 0
         check("screenshot written (with-password page)", size2 > 5000, "%d bytes" % size2)
+
+        shot_en = os.path.join(OUT, "04-english.png")
+        if os.path.exists(shot_en):
+            os.remove(shot_en)
+        edge(["--window-size=430,860", "--screenshot=" + shot_en, url_en])
+        size_en = os.path.getsize(shot_en) if os.path.exists(shot_en) else 0
+        check("screenshot written (english page)", size_en > 5000, "%d bytes" % size_en)
 
         shot3 = os.path.join(OUT, "03-join-three-boxes.png")
         if os.path.exists(shot3):

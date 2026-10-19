@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -32,7 +32,7 @@ namespace TrpgMaps
             {
                 return IsRecommended
                     ? Address + "  (" + InterfaceName + ")"
-                    : Address + "  (" + InterfaceName + " · 不可用于局域网)";
+                    : Address + "  (" + Loc.T("core.lan.no", InterfaceName) + ")";
             }
         }
 
@@ -82,7 +82,7 @@ namespace TrpgMaps
             if (scored.Count == 0)
             {
                 scored.Add(new KeyValuePair<LocalAddress, int>(
-                    new LocalAddress("127.0.0.1", "本机回环", false), 0));
+                    new LocalAddress("127.0.0.1", Loc.T("core.loopback"), false), 0));
             }
 
             var result = scored
@@ -285,12 +285,12 @@ namespace TrpgMaps
         {
             if (string.IsNullOrEmpty(ip))
             {
-                message = "请选择一个 IP 地址";
+                message = Loc.T("core.settings.ip.empty");
                 return false;
             }
             if (!IsValidPort(port))
             {
-                message = "端口必须在 1-65535 之间";
+                message = Loc.T("core.settings.port");
                 return false;
             }
 
@@ -299,7 +299,7 @@ namespace TrpgMaps
             available.Add("127.0.0.1");
             if (!available.Contains(ip))
             {
-                message = "本机当前没有地址 " + ip + "，请刷新后重新选择";
+                message = Loc.T("core.settings.ip.missing", ip);
                 return false;
             }
 
@@ -308,7 +308,7 @@ namespace TrpgMaps
                 _listenIp = ip;
                 _port = port;
             }
-            message = "已保存";
+            message = Loc.T("core.settings.saved");
             return true;
         }
     }
